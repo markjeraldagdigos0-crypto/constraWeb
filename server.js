@@ -335,7 +335,7 @@ const adminNav = `
     <a href="/admin/salary">Salary & Payroll</a>
     <a href="/admin/announcements">Announcements</a>
     <a href="/admin/settings">Company Settings</a>
-    <a href="/admin/schedule">Work Schedule & Time Windows</a>
+    <a href="/admin/schedule">Work Schedule</a>
     <a href="/admin/logout" style="background: var(--danger); color: white; margin-left: auto;">Logout</a>
   </nav>
 `;
@@ -841,11 +841,11 @@ app.get('/admin/schedule', requireAdmin, async (req, res) => {
   const schedRes = await pool.query('SELECT * FROM work_schedules LIMIT 1');
   const sched = schedRes.rows[0];
   let content = `
-    <header><div class="brand"><h2>Work Schedule & Time Windows</h2></div></header>
+    <header><div class="brand"><h2>Work Schedule</h2></div></header>
     ${adminNav}
     <div class="card">
       <form action="/admin/schedule" method="POST">
-        <h3>Morning Session Time Windows</h3>
+        <h3>Morning Session Settings</h3>
         <div style="display: flex; gap: 15px;">
           <div style="flex:1;"><label>Time IN Start</label><input type="time" name="morning_in_start" value="${sched.morning_in_start || '06:00'}"></div>
           <div style="flex:1;"><label>Time IN End</label><input type="time" name="morning_in_end" value="${sched.morning_in_end || '07:00'}"></div>
@@ -855,7 +855,7 @@ app.get('/admin/schedule', requireAdmin, async (req, res) => {
           <div style="flex:1;"><label>Time OUT End</label><input type="time" name="morning_out_end" value="${sched.morning_out_end || '12:00'}"></div>
         </div>
 
-        <h3 style="margin-top: 20px;">Afternoon Session Time Windows</h3>
+        <h3 style="margin-top: 20px;">Afternoon Session Settings</h3>
         <div style="display: flex; gap: 15px;">
           <div style="flex:1;"><label>Time IN Start</label><input type="time" name="afternoon_in_start" value="${sched.afternoon_in_start || '12:00'}"></div>
           <div style="flex:1;"><label>Time IN End</label><input type="time" name="afternoon_in_end" value="${sched.afternoon_in_end || '13:00'}"></div>
@@ -865,7 +865,7 @@ app.get('/admin/schedule', requireAdmin, async (req, res) => {
           <div style="flex:1;"><label>Time OUT End</label><input type="time" name="afternoon_out_end" value="${sched.afternoon_out_end || '18:00'}"></div>
         </div>
 
-        <button type="submit" class="btn btn-success" style="margin-top: 20px;">Save Schedule Windows</button>
+        <button type="submit" class="btn btn-success" style="margin-top: 20px;">Save Schedule</button>
       </form>
     </div>
   `;
@@ -1083,7 +1083,7 @@ app.get('/scanner', async (req, res) => {
     </header>
 
     <div class="card">
-      <h3>Worker QR Attendance Scanner (Time Window Validated & Meal Deduction)</h3>
+      <h3>Worker QR Attendance Scanner (Meal Deduction)</h3>
       <div style="margin-bottom: 15px; display: flex; gap: 10px;">
         <button onclick="setMode('IN')" id="btnIn" class="btn" style="flex: 1;">SELECT TIME IN</button>
         <button onclick="setMode('OUT')" id="btnOut" class="btn btn-warning" style="flex: 1;">SELECT TIME OUT</button>
@@ -1206,7 +1206,7 @@ app.get('/scanner', async (req, res) => {
   res.send(layout('Scanner Portal', content));
 });
 
-// API Endpoint Step 1: Validate Attendance Rules & Time Windows
+// API Endpoint Step 1: Validate Attendance Rules (Time Windows removed)
 app.post('/api/attendance/check', async (req, res) => {
   const { worker_id, attendance_type } = req.body;
   const client = await pool.connect();
@@ -1219,10 +1219,6 @@ app.post('/api/attendance/check', async (req, res) => {
     
     const ph = getPHTime();
     const today = ph.date;
-    const currentTime = ph.time.substring(0, 5);
-
-    const schedRes = await client.query('SELECT * FROM work_schedules LIMIT 1');
-    const sched = schedRes.rows[0];
 
     const todayLogsRes = await client.query(
       'SELECT * FROM attendance_logs WHERE worker_id = $1 AND attendance_date = $2 ORDER BY attendance_time ASC, id ASC',
@@ -1232,29 +1228,19 @@ app.post('/api/attendance/check', async (req, res) => {
 
     let expectedType = '';
     let stepDescription = '';
-    let timeStart = '';
-    let timeEnd = '';
 
     if (logsCount === 0) {
       expectedType = 'IN';
       stepDescription = '1st Scan: Umaga Time IN';
-      timeStart = sched.morning_in_start || '06:00';
-      timeEnd = sched.morning_in_end || '07:00';
     } else if (logsCount === 1) {
       expectedType = 'OUT';
       stepDescription = '2nd Scan: Umaga Time OUT (Lunch Break)';
-      timeStart = sched.morning_out_start || '11:30';
-      timeEnd = sched.morning_out_end || '12:00';
     } else if (logsCount === 2) {
       expectedType = 'IN';
       stepDescription = '3rd Scan: Hapon Time IN';
-      timeStart = sched.afternoon_in_start || '12:00';
-      timeEnd = sched.afternoon_in_end || '13:00';
     } else if (logsCount === 3) {
       expectedType = 'OUT';
       stepDescription = '4th Scan: Hapon Time OUT (Uwian)';
-      timeStart = sched.afternoon_out_start || '17:00';
-      timeEnd = sched.afternoon_out_end || '18:00';
     } else {
       return res.json({ success: false, message: 'Tapos na ang 4 na beses na pag-scan mo ngayong araw.' });
     }
@@ -1263,13 +1249,6 @@ app.post('/api/attendance/check', async (req, res) => {
       return res.json({ 
         success: false, 
         message: `Maling pindot! Ang sunod mong i-scan ay ${expectedType} (${stepDescription}).` 
-      });
-    }
-
-    if (currentTime < timeStart || currentTime > timeEnd) {
-      return res.json({
-        success: false,
-        message: `Bawal pang mag-scan! Ang oras para sa ${stepDescription} ay sa pagitan ng ${timeStart} hanggang ${timeEnd}. (Current Time: ${ph.time})`
       });
     }
 

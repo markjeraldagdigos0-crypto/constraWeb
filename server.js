@@ -124,7 +124,6 @@ async function initDB() {
       );
     `);
 
-    // Automatic Migration: Siguruhing may password column ang workers table kung luma na ito
     await pool.query(`
       ALTER TABLE workers ADD COLUMN IF NOT EXISTS password TEXT NOT NULL DEFAULT '';
     `);
@@ -151,7 +150,6 @@ async function getSettings() {
   return res.rows[0] || { company_name: 'BuildCorp Construction', company_logo: '', company_address: '', contact_number: '', default_meal_deduction: 50.00 };
 }
 
-// Middleware to protect Admin Routes
 function requireAdmin(req, res, next) {
   if (req.session && req.session.adminId) {
     return next();
@@ -213,9 +211,7 @@ function layout(title, content) {
   `;
 }
 
-// ==========================================
 // MAIN PAGE /
-// ==========================================
 app.get('/', async (req, res) => {
   const settings = await getSettings();
   const html = `
@@ -234,9 +230,7 @@ app.get('/', async (req, res) => {
   res.send(layout(settings.company_name + ' - Main', html));
 });
 
-// ==========================================
 // ADMIN AUTHENTICATION ROUTES
-// ==========================================
 app.get('/admin/login', async (req, res) => {
   const settings = await getSettings();
   const error = req.query.error || '';
@@ -330,9 +324,7 @@ app.get('/admin/logout', (req, res) => {
   });
 });
 
-// ==========================================
-// ADMIN PORTAL /admin (Protected by requireAdmin)
-// ==========================================
+// ADMIN PORTAL
 const adminNav = `
   <nav class="no-print">
     <a href="/admin">Dashboard</a>
@@ -383,7 +375,6 @@ app.get('/admin', requireAdmin, async (req, res) => {
   res.send(layout('Admin Dashboard', content));
 });
 
-// Worker Management
 app.get('/admin/workers', requireAdmin, async (req, res) => {
   const search = req.query.search || '';
   const workers = await pool.query('SELECT * FROM workers WHERE full_name ILIKE $1 OR worker_id ILIKE $1 ORDER BY id DESC', [`%${search}%`]);
@@ -516,7 +507,6 @@ app.get('/admin/workers/toggle/:worker_id', requireAdmin, async (req, res) => {
   res.redirect('/admin/workers');
 });
 
-// Delete Worker Route
 app.get('/admin/workers/delete/:worker_id', requireAdmin, async (req, res) => {
   const { worker_id } = req.params;
   const client = await pool.connect();
@@ -535,7 +525,6 @@ app.get('/admin/workers/delete/:worker_id', requireAdmin, async (req, res) => {
   res.redirect('/admin/workers');
 });
 
-// Admin Attendance Report & Clear Logs
 app.get('/admin/attendance', requireAdmin, async (req, res) => {
   const search = req.query.search || '';
   const dateFilter = req.query.date || '';
@@ -578,7 +567,6 @@ app.get('/admin/attendance/clear', requireAdmin, async (req, res) => {
   res.redirect('/admin/attendance');
 });
 
-// Advance Money Management
 app.get('/admin/advance', requireAdmin, async (req, res) => {
   const workers = await pool.query("SELECT * FROM workers WHERE status = 'Active'");
   const advances = await pool.query('SELECT am.*, w.full_name FROM advance_money am JOIN workers w ON am.worker_id = w.worker_id ORDER BY am.advance_date DESC');
@@ -620,7 +608,6 @@ app.post('/admin/advance', requireAdmin, async (req, res) => {
   res.redirect('/admin/advance');
 });
 
-// Deductions Management (Meal, etc.)
 app.get('/admin/deductions', requireAdmin, async (req, res) => {
   const workers = await pool.query("SELECT * FROM workers WHERE status = 'Active'");
   const deductionsList = await pool.query('SELECT d.*, w.full_name FROM deductions d JOIN workers w ON d.worker_id = w.worker_id ORDER BY d.deduction_date DESC');
@@ -676,7 +663,6 @@ app.post('/admin/deductions', requireAdmin, async (req, res) => {
   res.redirect('/admin/deductions');
 });
 
-// Salary Calculation Report
 app.get('/admin/salary', requireAdmin, async (req, res) => {
   const settings = await getSettings();
   const workers = await pool.query('SELECT * FROM workers');
@@ -791,7 +777,6 @@ app.get('/admin/salary/reset', requireAdmin, async (req, res) => {
   res.redirect('/admin/salary');
 });
 
-// Announcements Management
 app.get('/admin/announcements', requireAdmin, async (req, res) => {
   const anns = await pool.query('SELECT * FROM announcements ORDER BY created_at DESC');
   let content = `
@@ -821,7 +806,6 @@ app.post('/admin/announcements', requireAdmin, async (req, res) => {
   res.redirect('/admin/announcements');
 });
 
-// Company Settings
 app.get('/admin/settings', requireAdmin, async (req, res) => {
   const settings = await getSettings();
   let content = `
@@ -853,7 +837,6 @@ app.post('/admin/settings', requireAdmin, async (req, res) => {
   res.redirect('/admin/settings');
 });
 
-// Work Schedule & Time Windows Configuration
 app.get('/admin/schedule', requireAdmin, async (req, res) => {
   const schedRes = await pool.query('SELECT * FROM work_schedules LIMIT 1');
   const sched = schedRes.rows[0];
@@ -897,9 +880,7 @@ app.post('/admin/schedule', requireAdmin, async (req, res) => {
 });
 
 
-// ==========================================
-// WORKER PORTAL /worker (With Password Protection)
-// ==========================================
+// WORKER PORTAL
 app.get('/worker/login', async (req, res) => {
   const settings = await getSettings();
   const error = req.query.error || '';
@@ -948,6 +929,36 @@ app.get('/worker/logout', (req, res) => {
   });
 });
 
+// Worker Change Password Endpoint
+app.post('/worker/change-password', async (req, res) => {
+  if (!req.session || !req.session.workerId) {
+    return res.redirect('/worker/login');
+  }
+
+  const worker_id = req.session.workerId;
+  const { current_password, new_password } = req.body;
+
+  try {
+    const result = await pool.query('SELECT * FROM workers WHERE worker_id = $1', [worker_id]);
+    if (result.rows.length === 0) {
+      return res.redirect('/worker?error=Worker not found.');
+    }
+
+    const worker = result.rows[0];
+    const match = await bcrypt.compare(current_password, worker.password);
+    if (!match) {
+      return res.redirect('/worker?error=Mali ang iyong kasalukuyang password.');
+    }
+
+    const hashedNewPassword = await bcrypt.hash(new_password, 10);
+    await pool.query('UPDATE workers SET password = $1 WHERE worker_id = $2', [hashedNewPassword, worker_id]);
+
+    res.redirect('/worker?success=Matagumpay na nabago ang iyong password!');
+  } catch (err) {
+    res.redirect('/worker?error=Server error sa pagpapalit ng password.');
+  }
+});
+
 app.get('/worker', async (req, res) => {
   if (!req.session || !req.session.workerId) {
     return res.redirect('/worker/login');
@@ -955,6 +966,9 @@ app.get('/worker', async (req, res) => {
 
   const settings = await getSettings();
   const worker_id = req.session.workerId;
+  const errorMsg = req.query.error || '';
+  const successMsg = req.query.success || '';
+
   let worker = null;
   let attendance = [];
   let advances = [];
@@ -984,6 +998,10 @@ app.get('/worker', async (req, res) => {
         <a href="/worker/logout" class="btn btn-danger" style="padding: 6px 12px; font-size: 13px;">Logout</a>
       </div>
     </header>
+
+    ${errorMsg ? `<div class="alert-box alert-danger">${errorMsg}</div>` : ''}
+    ${successMsg ? `<div class="alert-box alert-success">${successMsg}</div>` : ''}
+
     ${worker ? `
       <div class="card">
         <h3>Welcome, ${worker.full_name} (${worker.worker_id})</h3>
@@ -991,6 +1009,18 @@ app.get('/worker', async (req, res) => {
         <p><strong>Assigned Project:</strong> ${worker.assigned_project || '-'}</p>
         <p><strong>Daily Rate:</strong> ₱${worker.daily_rate}</p>
       </div>
+
+      <div class="card">
+        <h3>Palitan ang Password</h3>
+        <form action="/worker/change-password" method="POST">
+          <label>Kasalukuyang Password (Current Password)</label>
+          <input type="password" name="current_password" required>
+          <label>Bagong Password (New Password)</label>
+          <input type="password" name="new_password" required>
+          <button type="submit" class="btn">I-update ang Password</button>
+        </form>
+      </div>
+
       <div class="card" style="text-align: center;">
         <h3>My QR Code</h3>
         <div id="qrcode" style="display: flex; justify-content: center; margin: 15px 0;"></div>
@@ -1040,9 +1070,7 @@ app.get('/worker', async (req, res) => {
 });
 
 
-// ==========================================
-// SCANNER PORTAL /scanner
-// ==========================================
+// SCANNER PORTAL
 app.get('/scanner', async (req, res) => {
   const settings = await getSettings();
 

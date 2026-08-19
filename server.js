@@ -449,10 +449,12 @@ app.get('/admin/workers/register', requireAdmin, async (req, res) => {
 
 app.post('/admin/workers/register', requireAdmin, async (req, res) => {
   const { worker_id, full_name, position, contact_number, daily_rate, assigned_project } = req.body;
+  
   try {
     if (!worker_id) {
       return res.status(400).send('Error: Worker ID is missing.');
     }
+
     const defaultPassword = await bcrypt.hash(worker_id, 10);
     await pool.query(
       'INSERT INTO workers (worker_id, password, full_name, position, contact_number, daily_rate, assigned_project) VALUES ($1, $2, $3, $4, $5, $6, $7)',
@@ -1034,7 +1036,7 @@ app.get('/worker', async (req, res) => {
 
 
 // ==========================================
-// SCANNER PORTAL /scanner (Stock Inventory removed)
+// SCANNER PORTAL /scanner
 // ==========================================
 app.get('/scanner', async (req, res) => {
   const settings = await getSettings();

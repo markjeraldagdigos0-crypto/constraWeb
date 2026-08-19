@@ -427,7 +427,9 @@ app.get('/admin/workers/register', requireAdmin, async (req, res) => {
     <div class="card">
       <form action="/admin/workers/register" method="POST">
         <label>Worker ID (Auto Generated - Default password will be same as ID)</label>
-        <input type="text" name="worker_id" value="${autoWorkerId}" readonly style="background: #e2e8f0;">
+        <input type="text" value="${autoWorkerId}" disabled style="background: #e2e8f0;">
+        <input type="hidden" name="worker_id" value="${autoWorkerId}">
+        
         <label>Full Name</label>
         <input type="text" name="full_name" required>
         <label>Position</label>
@@ -447,11 +449,20 @@ app.get('/admin/workers/register', requireAdmin, async (req, res) => {
 
 app.post('/admin/workers/register', requireAdmin, async (req, res) => {
   const { worker_id, full_name, position, contact_number, daily_rate, assigned_project } = req.body;
-  // Default password is set to worker_id (e.g. W-0001)
-  const defaultPassword = await bcrypt.hash(worker_id, 10);
-  await pool.query('INSERT INTO workers (worker_id, password, full_name, position, contact_number, daily_rate, assigned_project) VALUES ($1, $2, $3, $4, $5, $6, $7)',
-    [worker_id, defaultPassword, full_name, position, contact_number, daily_rate, assigned_project]);
-  res.redirect(`/admin/workers/qr/${worker_id}`);
+  try {
+    if (!worker_id) {
+      return res.status(400).send('Error: Worker ID is missing.');
+    }
+    const defaultPassword = await bcrypt.hash(worker_id, 10);
+    await pool.query(
+      'INSERT INTO workers (worker_id, password, full_name, position, contact_number, daily_rate, assigned_project) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+      [worker_id, defaultPassword, full_name, position, contact_number, daily_rate, assigned_project]
+    );
+    res.redirect(`/admin/workers/qr/${worker_id}`);
+  } catch (err) {
+    console.error('Error registering worker:', err);
+    res.status(500).send('Database Error during worker registration: ' + err.message);
+  }
 });
 
 app.get('/admin/workers/qr/:worker_id', requireAdmin, async (req, res) => {

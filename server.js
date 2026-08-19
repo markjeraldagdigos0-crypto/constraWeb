@@ -173,14 +173,13 @@ function requireAdmin(req, res, next) {
 // Helper to convert 24h to 12h format for display
 function formatTimeTo12Hour(time24) {
   if (!time24) return '';
-  // Kung sakaling naka-format nang "HH:MM:SS" o "HH:MM"
   const parts = time24.split(':');
   if (parts.length < 2) return time24;
   let hour = parseInt(parts[0], 10);
   const minute = parts[1];
   const ampm = hour >= 12 ? 'PM' : 'AM';
   hour = hour % 12;
-  hour = hour ? hour : 12; // 0 becomes 12
+  hour = hour ? hour : 12; 
   return `${hour}:${minute} ${ampm}`;
 }
 
@@ -487,6 +486,60 @@ app.post('/admin/workers/register', requireAdmin, async (req, res) => {
   } catch (err) {
     console.error('Error registering worker:', err);
     res.status(500).send('Database Error during worker registration: ' + err.message);
+  }
+});
+
+// EDIT WORKER ROUTES (NAIDAGDAG NA)
+app.get('/admin/workers/edit/:worker_id', requireAdmin, async (req, res) => {
+  const { worker_id } = req.params;
+  const workerRes = await pool.query('SELECT * FROM workers WHERE worker_id = $1', [worker_id]);
+  if (workerRes.rows.length === 0) return res.send('Worker not found');
+  const worker = workerRes.rows[0];
+
+  let content = `
+    <header><div class="brand"><h2>Edit Worker Details</h2></div></header>
+    ${adminNav}
+    <div class="card">
+      <form action="/admin/workers/edit/${worker.worker_id}" method="POST">
+        <label>Worker ID</label>
+        <input type="text" value="${worker.worker_id}" disabled style="background: #e2e8f0;">
+        
+        <label>Full Name</label>
+        <input type="text" name="full_name" value="${worker.full_name}" required>
+        
+        <label>Position</label>
+        <input type="text" name="position" value="${worker.position}" required>
+        
+        <label>Contact Number</label>
+        <input type="text" name="contact_number" value="${worker.contact_number || ''}">
+        
+        <label>Daily Rate (₱)</label>
+        <input type="number" step="0.01" name="daily_rate" value="${worker.daily_rate}" required>
+        
+        <label>Assigned Project</label>
+        <input type="text" name="assigned_project" value="${worker.assigned_project || ''}">
+        
+        <button type="submit" class="btn btn-success">Update Worker</button>
+        <a href="/admin/workers" class="btn btn-warning">Cancel</a>
+      </form>
+    </div>
+  `;
+  res.send(layout('Edit Worker', content));
+});
+
+app.post('/admin/workers/edit/:worker_id', requireAdmin, async (req, res) => {
+  const { worker_id } = req.params;
+  const { full_name, position, contact_number, daily_rate, assigned_project } = req.body;
+  
+  try {
+    await pool.query(
+      'UPDATE workers SET full_name = $1, position = $2, contact_number = $3, daily_rate = $4, assigned_project = $5 WHERE worker_id = $6',
+      [full_name, position, contact_number, daily_rate, assigned_project, worker_id]
+    );
+    res.redirect('/admin/workers');
+  } catch (err) {
+    console.error('Error updating worker:', err);
+    res.status(500).send('Database Error during worker update: ' + err.message);
   }
 });
 
@@ -1269,7 +1322,7 @@ app.post('/api/attendance/check', async (req, res) => {
     
     const ph = getPHTime();
     const today = ph.date;
-    const currentTime24 = ph.time24; // e.g. "06:30:00"
+    const currentTime24 = ph.time24;
 
     const todayLogsRes = await client.query(
       'SELECT * FROM attendance_logs WHERE worker_id = $1 AND attendance_date = $2 ORDER BY created_at ASC, id ASC',
@@ -1330,7 +1383,7 @@ app.post('/api/attendance/check', async (req, res) => {
       }
 
       if (windowStart && windowEnd) {
-        const curTime = currentTime24.substring(0, 5); // HH:MM
+        const curTime = currentTime24.substring(0, 5);
         if (curTime < windowStart || curTime > windowEnd) {
           return res.json({
             success: false,
@@ -1361,7 +1414,7 @@ app.post('/api/attendance/commit', async (req, res) => {
 
     const ph = getPHTime();
     const today = ph.date;
-    const timeStr12 = ph.time; // 12-hour format string e.g. "8:05:30 AM"
+    const timeStr12 = ph.time;
 
     await client.query(
       'INSERT INTO attendance_logs (worker_id, attendance_date, attendance_time, attendance_type) VALUES ($1, $2, $3, $4)',

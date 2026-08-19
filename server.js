@@ -87,6 +87,13 @@ async function initDB() {
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
 
+      CREATE TABLE IF NOT EXISTS worker_accounts (
+        id SERIAL PRIMARY KEY,
+        worker_id VARCHAR(50) UNIQUE NOT NULL,
+        password TEXT NOT NULL,
+        FOREIGN KEY (worker_id) REFERENCES workers(worker_id) ON DELETE CASCADE
+      );
+
       CREATE TABLE IF NOT EXISTS attendance_logs (
         id SERIAL PRIMARY KEY,
         worker_id VARCHAR(50) NOT NULL,
@@ -121,30 +128,6 @@ async function initDB() {
         content TEXT NOT NULL,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
-
-      CREATE TABLE IF NOT EXISTS materials (
-        id SERIAL PRIMARY KEY,
-        material_name VARCHAR(255) NOT NULL,
-        category VARCHAR(100),
-        unit VARCHAR(50),
-        current_quantity NUMERIC(10,2) NOT NULL DEFAULT 0,
-        minimum_stock_level NUMERIC(10,2) NOT NULL DEFAULT 10,
-        notes TEXT
-      );
-
-      CREATE TABLE IF NOT EXISTS stock_transactions (
-        id SERIAL PRIMARY KEY,
-        material_id INTEGER NOT NULL,
-        transaction_type VARCHAR(10) NOT NULL,
-        quantity NUMERIC(10,2) NOT NULL,
-        stock_after NUMERIC(10,2) NOT NULL,
-        reference_person VARCHAR(255),
-        project VARCHAR(255),
-        purpose TEXT,
-        notes TEXT,
-        recorded_from VARCHAR(50),
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
     `);
 
     const settingsCheck = await pool.query('SELECT * FROM company_settings');
@@ -175,6 +158,14 @@ function requireAdmin(req, res, next) {
     return next();
   }
   res.redirect('/admin/login');
+}
+
+// Middleware to protect Worker Routes
+function requireWorker(req, res, next) {
+  if (req.session && req.session.workerId) {
+    return next();
+  }
+  res.redirect('/worker/login');
 }
 
 function layout(title, content) {
@@ -240,11 +231,11 @@ app.get('/', async (req, res) => {
     <div style="text-align: center; padding: 40px 20px;">
       ${settings.company_logo ? `<img src="${settings.company_logo}" alt="Logo" style="max-height: 80px; margin-bottom: 15px;">` : ''}
       <h1 style="font-size: 32px; margin-bottom: 10px;">${settings.company_name}</h1>
-      <p style="color: #64748b; margin-bottom: 30px;">Construction Worker & Inventory Management System</p>
+      <p style="color: #64748b; margin-bottom: 30px;">Construction Worker Attendance & Payroll System</p>
       
       <div style="display: flex; justify-content: center; gap: 20px; flex-wrap: wrap;">
         <a href="/admin/login" class="btn" style="padding: 20px 40px; font-size: 18px;">ADMIN PORTAL</a>
-        <a href="/worker" class="btn btn-success" style="padding: 20px 40px; font-size: 18px;">WORKER PORTAL</a>
+        <a href="/worker/login" class="btn btn-success" style="padding: 20px 40px; font-size: 18px;">WORKER PORTAL</a>
         <a href="/scanner" class="btn btn-warning" style="padding: 20px 40px; font-size: 18px;">SCANNER PORTAL</a>
       </div>
     </div>
@@ -356,7 +347,6 @@ const adminNav = `
     <a href="/admin">Dashboard</a>
     <a href="/admin/workers">Workers</a>
     <a href="/admin/attendance">Attendance</a>
-    <a href="/admin/stock">Stock Inventory</a>
     <a href="/admin/advance">Advance Money</a>
     <a href="/admin/deductions">Deductions (Meal, etc.)</a>
     <a href="/admin/salary">Salary & Payroll</a>
@@ -373,8 +363,6 @@ app.get('/admin', requireAdmin, async (req, res) => {
   const phNow = getPHTime();
   const today = phNow.date;
   const presentToday = await pool.query('SELECT COUNT(DISTINCT worker_id) FROM attendance_logs WHERE attendance_date = $1', [today]);
-  const materialsCount = await pool.query('SELECT COUNT(*) FROM materials');
-  const lowStock = await pool.query('SELECT * FROM materials WHERE current_quantity <= minimum_stock_level');
   const recentAttendance = await pool.query('SELECT a.*, w.full_name FROM attendance_logs a JOIN workers w ON a.worker_id = w.worker_id ORDER BY a.created_at DESC LIMIT 5');
 
   let content = `
@@ -392,20 +380,7 @@ app.get('/admin', requireAdmin, async (req, res) => {
         <p><strong>Total Workers:</strong> ${workersCount.rows[0].count}</p>
         <p><strong>Present Today:</strong> ${presentToday.rows[0].count}</p>
       </div>
-      <div class="card">
-        <h3>Stock Overview</h3>
-        <p><strong>Total Materials:</strong> ${materialsCount.rows[0].count}</p>
-        <p><strong>Low Stock Items:</strong> ${lowStock.rows.length}</p>
-      </div>
     </div>
-    ${lowStock.rows.length > 0 ? `
-      <div class="card alert-danger">
-        <h3>LOW STOCK ALERT - PLEASE RESTOCK</h3>
-        <ul>
-          ${lowStock.rows.map(m => `<li>${m.material_name} (Current: ${m.current_quantity} ${m.unit}, Min: ${m.minimum_stock_level})</li>`).join('')}
-        </ul>
-      </div>
-    ` : ''}
     <div class="card">
       <h3>Recent Attendance Logs</h3>
       <table>
@@ -468,6 +443,8 @@ app.get('/admin/workers/register', requireAdmin, async (req, res) => {
         <input type="text" name="worker_id" value="${autoWorkerId}" readonly style="background: #e2e8f0;">
         <label>Full Name</label>
         <input type="text" name="full_name" required>
+        <label>Portal Password (Para sa Worker Portal Login)</label>
+        <input type="password" name="password" required>
         <label>Position</label>
         <input type="text" name="position" required>
         <label>Contact Number</label>
@@ -484,9 +461,22 @@ app.get('/admin/workers/register', requireAdmin, async (req, res) => {
 });
 
 app.post('/admin/workers/register', requireAdmin, async (req, res) => {
-  const { worker_id, full_name, position, contact_number, daily_rate, assigned_project } = req.body;
-  await pool.query('INSERT INTO workers (worker_id, full_name, position, contact_number, daily_rate, assigned_project) VALUES ($1, $2, $3, $4, $5, $6)',
-    [worker_id, full_name, position, contact_number, daily_rate, assigned_project]);
+  const { worker_id, full_name, password, position, contact_number, daily_rate, assigned_project } = req.body;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('INSERT INTO workers (worker_id, full_name, position, contact_number, daily_rate, assigned_project) VALUES ($1, $2, $3, $4, $5, $6)',
+      [worker_id, full_name, position, contact_number, daily_rate, assigned_project]);
+    
+    const hashedPassword = await bcrypt.hash(password, 10);
+    await client.query('INSERT INTO worker_accounts (worker_id, password) VALUES ($1, $2)', [worker_id, hashedPassword]);
+    
+    await client.query('COMMIT');
+  } catch (e) {
+    await client.query('ROLLBACK');
+  } finally {
+    client.release();
+  }
   res.redirect(`/admin/workers/qr/${worker_id}`);
 });
 
@@ -574,100 +564,6 @@ app.get('/admin/attendance', requireAdmin, async (req, res) => {
 app.get('/admin/attendance/clear', requireAdmin, async (req, res) => {
   await pool.query('DELETE FROM attendance_logs');
   res.redirect('/admin/attendance');
-});
-
-// Admin Stock Inventory
-app.get('/admin/stock', requireAdmin, async (req, res) => {
-  const materials = await pool.query('SELECT * FROM materials ORDER BY material_name ASC');
-  const history = await pool.query('SELECT st.*, m.material_name, m.unit FROM stock_transactions st JOIN materials m ON st.material_id = m.id ORDER BY st.created_at DESC LIMIT 20');
-
-  let content = `
-    <header><div class="brand"><h2>Stock Inventory</h2></div></header>
-    ${adminNav}
-    <div class="card">
-      <h3>Materials List</h3>
-      <a href="/admin/stock/add" class="btn btn-success" style="margin-bottom: 15px;">Add New Material</a>
-      <table>
-        <tr><th>Material</th><th>Category</th><th>Unit</th><th>Current Stock</th><th>Min Level</th><th>Status</th></tr>
-        ${materials.rows.map(m => `
-          <tr>
-            <td>${m.material_name}</td>
-            <td>${m.category || '-'}</td>
-            <td>${m.unit}</td>
-            <td>${m.current_quantity}</td>
-            <td>${m.minimum_stock_level}</td>
-            <td>${m.current_quantity <= m.minimum_stock_level ? '<span class="badge badge-danger">LOW STOCK</span>' : '<span class="badge badge-success">OK</span>'}</td>
-          </tr>
-        `).join('')}
-      </table>
-    </div>
-    <div class="card">
-      <h3>Recent Stock Transactions</h3>
-      <table>
-        <tr><th>Date/Time</th><th>Material</th><th>Type</th><th>Qty</th><th>Stock After</th><th>Reference / Project</th></tr>
-        ${history.rows.map(h => `
-          <tr>
-            <td>${h.created_at.toISOString().replace('T', ' ').substring(0, 16)}</td>
-            <td>${h.material_name}</td>
-            <td><span class="badge ${h.transaction_type === 'IN' ? 'badge-success' : 'badge-danger'}">${h.transaction_type}</span></td>
-            <td>${h.quantity} ${h.unit}</td>
-            <td>${h.stock_after}</td>
-            <td>${h.reference_person || h.project || '-'}</td>
-          </tr>
-        `).join('')}
-      </table>
-    </div>
-  `;
-  res.send(layout('Stock Inventory', content));
-});
-
-app.get('/admin/stock/add', requireAdmin, (req, res) => {
-  let content = `
-    <header><div class="brand"><h2>Add Material</h2></div></header>
-    ${adminNav}
-    <div class="card">
-      <form action="/admin/stock/add" method="POST">
-        <label>Material Name</label>
-        <input type="text" name="material_name" required>
-        <label>Category</label>
-        <input type="text" name="category">
-        <label>Unit (e.g., pcs, bags, kg)</label>
-        <input type="text" name="unit" required>
-        <label>Initial Quantity</label>
-        <input type="number" step="0.01" name="current_quantity" value="0" required>
-        <label>Minimum Stock Level (Alert Threshold)</label>
-        <input type="number" step="0.01" name="minimum_stock_level" value="10" required>
-        <label>Notes</label>
-        <textarea name="notes"></textarea>
-        <button type="submit" class="btn btn-success">Save Material</button>
-      </form>
-    </div>
-  `;
-  res.send(layout('Add Material', content));
-});
-
-app.post('/admin/stock/add', requireAdmin, async (req, res) => {
-  const { material_name, category, unit, current_quantity, minimum_stock_level, notes } = req.body;
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const matRes = await client.query(
-      'INSERT INTO materials (material_name, category, unit, current_quantity, minimum_stock_level, notes) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id',
-      [material_name, category, unit, current_quantity, minimum_stock_level, notes]
-    );
-    if (parseFloat(current_quantity) > 0) {
-      await client.query(
-        'INSERT INTO stock_transactions (material_id, transaction_type, quantity, stock_after, reference_person, notes, recorded_from) VALUES ($1, $2, $3, $4, $5, $6, $7)',
-        [matRes.rows[0].id, 'IN', current_quantity, current_quantity, 'Initial Stock', notes, 'Admin']
-      );
-    }
-    await client.query('COMMIT');
-  } catch (e) {
-    await client.query('ROLLBACK');
-  } finally {
-    client.release();
-  }
-  res.redirect('/admin/stock');
 });
 
 // Advance Money Management
@@ -990,31 +886,72 @@ app.post('/admin/schedule', requireAdmin, async (req, res) => {
 
 
 // ==========================================
-// WORKER PORTAL /worker
+// WORKER AUTHENTICATION & PORTAL /worker
 // ==========================================
-app.get('/worker', async (req, res) => {
+app.get('/worker/login', async (req, res) => {
   const settings = await getSettings();
-  const worker_id = req.query.worker_id || '';
-  let worker = null;
-  let attendance = [];
-  let advances = [];
-  let deductions = [];
-  let announcements = [];
+  const error = req.query.error || '';
+  let content = `
+    <div style="max-width: 400px; margin: 50px auto;" class="card">
+      <h2 style="text-align: center; margin-bottom: 20px;">Worker Portal Login</h2>
+      ${error ? `<div class="alert-box alert-danger">${error}</div>` : ''}
+      <form action="/worker/login" method="POST">
+        <label>Worker ID (e.g. W-0001)</label>
+        <input type="text" name="worker_id" required>
+        <label>Password</label>
+        <input type="password" name="password" required>
+        <button type="submit" class="btn btn-success" style="width: 100%; padding: 12px; margin-bottom: 15px;">Login Portal</button>
+      </form>
+    </div>
+  `;
+  res.send(layout(settings.company_name + ' - Worker Login', content));
+});
 
-  if (worker_id) {
-    const wRes = await pool.query('SELECT * FROM workers WHERE worker_id = $1', [worker_id]);
-    if (wRes.rows.length > 0) {
-      worker = wRes.rows[0];
-      const attRes = await pool.query('SELECT * FROM attendance_logs WHERE worker_id = $1 ORDER BY attendance_date DESC, attendance_time DESC LIMIT 20', [worker_id]);
-      attendance = attRes.rows;
-      const advRes = await pool.query('SELECT * FROM advance_money WHERE worker_id = $1 ORDER BY advance_date DESC', [worker_id]);
-      advances = advRes.rows;
-      const dedRes = await pool.query('SELECT * FROM deductions WHERE worker_id = $1 ORDER BY deduction_date DESC', [worker_id]);
-      deductions = dedRes.rows;
+app.post('/worker/login', async (req, res) => {
+  const { worker_id, password } = req.body;
+  try {
+    const accRes = await pool.query('SELECT * FROM worker_accounts WHERE worker_id = $1', [worker_id]);
+    if (accRes.rows.length === 0) {
+      return res.redirect('/worker/login?error=Invalid Worker ID or Password.');
     }
+    const account = accRes.rows[0];
+    const match = await bcrypt.compare(password, account.password);
+    if (!match) {
+      return res.redirect('/worker/login?error=Invalid Worker ID or Password.');
+    }
+
+    req.session.workerId = account.worker_id;
+    res.redirect('/worker');
+  } catch (err) {
+    res.redirect('/worker/login?error=Server error during login.');
   }
+});
+
+app.get('/worker/logout', (req, res) => {
+  req.session.destroy(() => {
+    res.redirect('/worker/login');
+  });
+});
+
+app.get('/worker', requireWorker, async (req, res) => {
+  const settings = await getSettings();
+  const worker_id = req.session.workerId;
+  
+  const wRes = await pool.query('SELECT * FROM workers WHERE worker_id = $1', [worker_id]);
+  if (wRes.rows.length === 0) return res.redirect('/worker/logout');
+  const worker = wRes.rows[0];
+
+  const attRes = await pool.query('SELECT * FROM attendance_logs WHERE worker_id = $1 ORDER BY attendance_date DESC, attendance_time DESC LIMIT 20', [worker_id]);
+  const attendance = attRes.rows;
+
+  const advRes = await pool.query('SELECT * FROM advance_money WHERE worker_id = $1 ORDER BY advance_date DESC', [worker_id]);
+  const advances = advRes.rows;
+
+  const dedRes = await pool.query('SELECT * FROM deductions WHERE worker_id = $1 ORDER BY deduction_date DESC', [worker_id]);
+  const deductions = dedRes.rows;
+
   const annRes = await pool.query('SELECT * FROM announcements ORDER BY created_at DESC LIMIT 5');
-  announcements = annRes.rows;
+  const announcements = annRes.rows;
 
   let content = `
     <header>
@@ -1022,62 +959,55 @@ app.get('/worker', async (req, res) => {
         ${settings.company_logo ? `<img src="${settings.company_logo}" alt="Logo">` : ''}
         <h2>${settings.company_name} - Worker Portal</h2>
       </div>
+      <div>
+        <a href="/worker/logout" class="btn btn-danger" style="padding: 6px 12px; font-size: 12px;">Logout</a>
+      </div>
     </header>
     <div class="card">
-      <h3>Enter Your Worker ID to View Information</h3>
-      <form action="/worker" method="GET" style="display: flex; gap: 10px;">
-        <input type="text" name="worker_id" placeholder="e.g. W-0001" value="${worker_id}" required>
-        <button type="submit" class="btn" style="height: 42px;">View Profile</button>
-      </form>
+      <h3>Welcome, ${worker.full_name} (${worker.worker_id})</h3>
+      <p><strong>Position:</strong> ${worker.position}</p>
+      <p><strong>Assigned Project:</strong> ${worker.assigned_project || '-'}</p>
+      <p><strong>Daily Rate:</strong> ₱${worker.daily_rate}</p>
     </div>
-    ${worker_id && !worker ? `<div class="card alert-danger">Worker ID not found.</div>` : ''}
-    ${worker ? `
-      <div class="card">
-        <h3>Welcome, ${worker.full_name} (${worker.worker_id})</h3>
-        <p><strong>Position:</strong> ${worker.position}</p>
-        <p><strong>Assigned Project:</strong> ${worker.assigned_project || '-'}</p>
-        <p><strong>Daily Rate:</strong> ₱${worker.daily_rate}</p>
-      </div>
-      <div class="card" style="text-align: center;">
-        <h3>My QR Code</h3>
-        <div id="qrcode" style="display: flex; justify-content: center; margin: 15px 0;"></div>
-        <p><strong>${worker.worker_id}</strong></p>
-      </div>
-      <div class="card">
-        <h3>My Recent Attendance</h3>
-        <table>
-          <tr><th>Date</th><th>Time</th><th>Type</th></tr>
-          ${attendance.map(a => `<tr><td>${a.attendance_date.toISOString().split('T')[0]}</td><td>${a.attendance_time}</td><td><span class="badge ${a.attendance_type === 'IN' ? 'badge-success' : 'badge-warning'}">${a.attendance_type}</span></td></tr>`).join('')}
-        </table>
-      </div>
-      <div class="card">
-        <h3>My Advances & Deductions</h3>
-        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px;">
-          <div>
-            <h4>Advances History</h4>
-            <table>
-              <tr><th>Date</th><th>Amount</th></tr>
-              ${advances.map(ad => `<tr><td>${ad.advance_date.toISOString().split('T')[0]}</td><td>₱${ad.amount}</td></tr>`).join('')}
-            </table>
-          </div>
-          <div>
-            <h4>Deductions (Meal, etc.)</h4>
-            <table>
-              <tr><th>Date</th><th>Name</th><th>Amount</th></tr>
-              ${deductions.map(dd => `<tr><td>${dd.deduction_date.toISOString().split('T')[0]}</td><td>${dd.deduction_name}</td><td>₱${dd.amount}</td></tr>`).join('')}
-            </table>
-          </div>
+    <div class="card" style="text-align: center;">
+      <h3>My QR Code</h3>
+      <div id="qrcode" style="display: flex; justify-content: center; margin: 15px 0;"></div>
+      <p><strong>${worker.worker_id}</strong></p>
+    </div>
+    <div class="card">
+      <h3>My Recent Attendance</h3>
+      <table>
+        <tr><th>Date</th><th>Time</th><th>Type</th></tr>
+        ${attendance.map(a => `<tr><td>${a.attendance_date.toISOString().split('T')[0]}</td><td>${a.attendance_time}</td><td><span class="badge ${a.attendance_type === 'IN' ? 'badge-success' : 'badge-warning'}">${a.attendance_type}</span></td></tr>`).join('')}
+      </table>
+    </div>
+    <div class="card">
+      <h3>My Advances & Deductions</h3>
+      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px;">
+        <div>
+          <h4>Advances History</h4>
+          <table>
+            <tr><th>Date</th><th>Amount</th></tr>
+            ${advances.map(ad => `<tr><td>${ad.advance_date.toISOString().split('T')[0]}</td><td>₱${ad.amount}</td></tr>`).join('')}
+          </table>
+        </div>
+        <div>
+          <h4>Deductions (Meal, etc.)</h4>
+          <table>
+            <tr><th>Date</th><th>Name</th><th>Amount</th></tr>
+            ${deductions.map(dd => `<tr><td>${dd.deduction_date.toISOString().split('T')[0]}</td><td>${dd.deduction_name}</td><td>₱${dd.amount}</td></tr>`).join('')}
+          </table>
         </div>
       </div>
-      <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
-      <script>
-        new QRCode(document.getElementById("qrcode"), {
-          text: "${worker.worker_id}",
-          width: 150,
-          height: 150
-        });
-      </script>
-    ` : ''}
+    </div>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+    <script>
+      new QRCode(document.getElementById("qrcode"), {
+        text: "${worker.worker_id}",
+        width: 150,
+        height: 150
+      });
+    </script>
     <div class="card">
       <h3>Announcements</h3>
       ${announcements.map(a => `<div style="border-bottom: 1px solid #cbd5e1; padding: 10px 0;"><h4>${a.title}</h4><p>${a.content}</p></div>`).join('')}
@@ -1092,13 +1022,12 @@ app.get('/worker', async (req, res) => {
 // ==========================================
 app.get('/scanner', async (req, res) => {
   const settings = await getSettings();
-  const materials = await pool.query('SELECT * FROM materials ORDER BY material_name ASC');
 
   let content = `
     <header>
       <div class="brand">
         ${settings.company_logo ? `<img src="${settings.company_logo}" alt="Logo">` : ''}
-        <h2>${settings.company_name} - Scanner & Inventory Portal</h2>
+        <h2>${settings.company_name} - Scanner Portal</h2>
       </div>
     </header>
 
@@ -1126,46 +1055,6 @@ app.get('/scanner', async (req, res) => {
         <div style="display:flex; gap:15px; justify-content:center;">
           <button onclick="resolveMeal(true)" class="btn btn-success" style="flex:1; padding:12px;">OO (Kain)</button>
           <button onclick="resolveMeal(false)" class="btn btn-danger" style="flex:1; padding:12px;">HINDI</button>
-        </div>
-      </div>
-    </div>
-
-    <div class="card">
-      <h3>Stock IN / OUT Management</h3>
-      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
-        <div>
-          <h4>Record Stock IN</h4>
-          <form action="/scanner/stock-in" method="POST">
-            <label>Material</label>
-            <select name="material_id" required>
-              ${materials.rows.map(m => `<option value="${m.id}">${m.material_name} (${m.unit})</option>`).join('')}
-            </select>
-            <label>Quantity Received</label>
-            <input type="number" step="0.01" name="quantity" required>
-            <label>Supplier / Reference</label>
-            <input type="text" name="reference_person" required>
-            <label>Notes</label>
-            <textarea name="notes"></textarea>
-            <button type="submit" class="btn btn-success">Save Stock IN</button>
-          </form>
-        </div>
-        <div>
-          <h4>Record Stock OUT</h4>
-          <form action="/scanner/stock-out" method="POST">
-            <label>Material</label>
-            <select name="material_id" required>
-              ${materials.rows.map(m => `<option value="${m.id}">${m.material_name} (Current: ${m.current_quantity} ${m.unit})</option>`).join('')}
-            </select>
-            <label>Quantity Issued</label>
-            <input type="number" step="0.01" name="quantity" required>
-            <label>Issued To / Project</label>
-            <input type="text" name="project" required>
-            <label>Purpose</label>
-            <input type="text" name="purpose" required>
-            <label>Notes</label>
-            <textarea name="notes"></textarea>
-            <button type="submit" class="btn btn-danger">Save Stock OUT</button>
-          </form>
         </div>
       </div>
     </div>
@@ -1379,58 +1268,6 @@ app.post('/api/attendance/commit', async (req, res) => {
   } finally {
     client.release();
   }
-});
-
-// Scanner Stock IN
-app.post('/scanner/stock-in', async (req, res) => {
-  const { material_id, quantity, reference_person, notes } = req.body;
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const matRes = await client.query('SELECT * FROM materials WHERE id = $1', [material_id]);
-    const mat = matRes.rows[0];
-    const newStock = parseFloat(mat.current_quantity) + parseFloat(quantity);
-
-    await client.query('UPDATE materials SET current_quantity = $1 WHERE id = $2', [newStock, material_id]);
-    await client.query(
-      'INSERT INTO stock_transactions (material_id, transaction_type, quantity, stock_after, reference_person, notes, recorded_from) VALUES ($1, $2, $3, $4, $5, $6, $7)',
-      [material_id, 'IN', quantity, newStock, reference_person, notes, 'Scanner']
-    );
-    await client.query('COMMIT');
-  } catch (e) {
-    await client.query('ROLLBACK');
-  } finally {
-    client.release();
-  }
-  res.redirect('/scanner');
-});
-
-// Scanner Stock OUT
-app.post('/scanner/stock-out', async (req, res) => {
-  const { material_id, quantity, project, purpose, notes } = req.body;
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const matRes = await client.query('SELECT * FROM materials WHERE id = $1', [material_id]);
-    const mat = matRes.rows[0];
-    if (parseFloat(quantity) > parseFloat(mat.current_quantity)) {
-      await client.query('ROLLBACK');
-      client.release();
-      return res.send('<script>alert("Insufficient Stock."); window.location="/scanner";</script>');
-    }
-    const newStock = parseFloat(mat.current_quantity) - parseFloat(quantity);
-    await client.query('UPDATE materials SET current_quantity = $1 WHERE id = $2', [newStock, material_id]);
-    await client.query(
-      'INSERT INTO stock_transactions (material_id, transaction_type, quantity, stock_after, project, purpose, notes, recorded_from) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)',
-      [material_id, 'OUT', quantity, newStock, project, purpose, notes, 'Scanner']
-    );
-    await client.query('COMMIT');
-  } catch (e) {
-    await client.query('ROLLBACK');
-  } finally {
-    client.release();
-  }
-  res.redirect('/scanner');
 });
 
 const server = app.listen(PORT, () => {

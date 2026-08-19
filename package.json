@@ -8,6 +8,8 @@
   },
   "dependencies": {
     "express": "^4.19.2",
+    "express": "^4.x.x",
+  "express-session": "^1.x.x",
     "pg": "^8.11.3"
   },
   "engines": {

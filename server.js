@@ -82,6 +82,16 @@ async function initDB() {
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
 
+      CREATE TABLE IF NOT EXISTS deductions (
+        id SERIAL PRIMARY KEY,
+        worker_id VARCHAR(50) NOT NULL,
+        deduction_name VARCHAR(100) NOT NULL,
+        amount NUMERIC(10,2) NOT NULL,
+        deduction_date DATE NOT NULL,
+        notes TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+
       CREATE TABLE IF NOT EXISTS announcements (
         id SERIAL PRIMARY KEY,
         title VARCHAR(255) NOT NULL,
@@ -219,6 +229,7 @@ const adminNav = `
     <a href="/admin/attendance">Attendance</a>
     <a href="/admin/stock">Stock Inventory</a>
     <a href="/admin/advance">Advance Money</a>
+    <a href="/admin/deductions">Deductions (Meal, etc.)</a>
     <a href="/admin/salary">Salary & Payroll</a>
     <a href="/admin/announcements">Announcements</a>
     <a href="/admin/settings">Company Settings</a>
@@ -538,7 +549,7 @@ app.get('/admin/advance', async (req, res) => {
     <header><div class="brand"><h2>Advance Money Management</h2></div></header>
     ${adminNav}
     <div class="card">
-      <h3>Record Advance Money</h3>
+      <h3>Record Advance Money (Cash Advance)</h3>
       <form action="/admin/advance" method="POST">
         <label>Select Worker</label>
         <select name="worker_id" required>
@@ -570,7 +581,65 @@ app.post('/admin/advance', async (req, res) => {
   res.redirect('/admin/advance');
 });
 
-// Salary Calculation Report, Summary & Reset to 0 (Handles 4-scan logs pairs: Morning IN-OUT, Afternoon IN-OUT)
+// ==========================================
+// DEDUCTIONS MANAGEMENT (Meal, etc.)
+// ==========================================
+app.get('/admin/deductions', async (req, res) => {
+  const workers = await pool.query("SELECT * FROM workers WHERE status = 'Active'");
+  const deductionsList = await pool.query('SELECT d.*, w.full_name FROM deductions d JOIN workers w ON d.worker_id = w.worker_id ORDER BY d.deduction_date DESC');
+  const phNow = getPHTime();
+
+  let content = `
+    <header><div class="brand"><h2>Worker Deductions Management</h2></div></header>
+    ${adminNav}
+    <div class="card">
+      <h3>Add Deduction (e.g. Meal, Uniform, SSS, etc.)</h3>
+      <form action="/admin/deductions" method="POST">
+        <label>Select Worker</label>
+        <select name="worker_id" required>
+          ${workers.rows.map(w => `<option value="${w.worker_id}">${w.full_name} (${w.worker_id})</option>`).join('')}
+        </select>
+        <label>Deduction Type / Name (e.g. Meal Allowance, Uniform, SSS)</label>
+        <input type="text" name="deduction_name" placeholder="Meal Deduction" required>
+        <label>Amount (₱)</label>
+        <input type="number" step="0.01" name="amount" required>
+        <label>Date</label>
+        <input type="date" name="deduction_date" value="${phNow.date}" required>
+        <label>Notes</label>
+        <textarea name="notes" placeholder="Optional notes..."></textarea>
+        <button type="submit" class="btn btn-success">Save Deduction</button>
+      </form>
+    </div>
+    <div class="card">
+      <h3>Deductions History</h3>
+      <table>
+        <tr><th>Worker ID</th><th>Name</th><th>Deduction Name</th><th>Amount</th><th>Date</th><th>Notes</th></tr>
+        ${deductionsList.rows.map(d => `
+          <tr>
+            <td>${d.worker_id}</td>
+            <td>${d.full_name}</td>
+            <td>${d.deduction_name}</td>
+            <td>₱${parseFloat(d.amount).toFixed(2)}</td>
+            <td>${d.deduction_date.toISOString().split('T')[0]}</td>
+            <td>${d.notes || '-'}</td>
+          </tr>
+        `).join('')}
+      </table>
+    </div>
+  `;
+  res.send(layout('Deductions', content));
+});
+
+app.post('/admin/deductions', async (req, res) => {
+  const { worker_id, deduction_name, amount, deduction_date, notes } = req.body;
+  await pool.query(
+    'INSERT INTO deductions (worker_id, deduction_name, amount, deduction_date, notes) VALUES ($1, $2, $3, $4, $5)',
+    [worker_id, deduction_name, amount, deduction_date, notes]
+  );
+  res.redirect('/admin/deductions');
+});
+
+// Salary Calculation Report, Summary & Reset to 0 (Handles 4-scan logs pairs + Advances + Deductions)
 app.get('/admin/salary', async (req, res) => {
   const settings = await getSettings();
   const workers = await pool.query('SELECT * FROM workers');
@@ -580,6 +649,7 @@ app.get('/admin/salary', async (req, res) => {
   let salaryData = [];
   let grandTotalGross = 0;
   let grandTotalAdvance = 0;
+  let grandTotalDeductions = 0;
   let grandTotalNet = 0;
 
   for (let w of workers.rows) {
@@ -610,13 +680,20 @@ app.get('/admin/salary', async (req, res) => {
     let equivalentDays = totalWorkingHours / fullDayHours;
     let totalSalary = equivalentDays * parseFloat(w.daily_rate);
 
+    // Get total advance money
     const advRes = await pool.query('SELECT SUM(amount) as total_adv FROM advance_money WHERE worker_id = $1', [w.worker_id]);
     let totalAdvance = parseFloat(advRes.rows[0].total_adv) || 0;
-    let netSalary = totalSalary - totalAdvance;
+
+    // Get total deductions (Meal, etc.)
+    const dedRes = await pool.query('SELECT SUM(amount) as total_ded FROM deductions WHERE worker_id = $1', [w.worker_id]);
+    let totalDeductions = parseFloat(dedRes.rows[0].total_ded) || 0;
+
+    let netSalary = totalSalary - totalAdvance - totalDeductions;
     if (netSalary < 0) netSalary = 0;
 
     grandTotalGross += totalSalary;
     grandTotalAdvance += totalAdvance;
+    grandTotalDeductions += totalDeductions;
     grandTotalNet += netSalary;
 
     salaryData.push({
@@ -625,6 +702,7 @@ app.get('/admin/salary', async (req, res) => {
       equivalentDays: equivalentDays.toFixed(2),
       totalSalary: totalSalary,
       totalAdvance: totalAdvance,
+      totalDeductions: totalDeductions,
       netSalary: netSalary
     });
   }
@@ -644,29 +722,30 @@ app.get('/admin/salary', async (req, res) => {
       </div>
       <div style="display: flex; gap: 10px;" class="no-print">
         <button onclick="window.print()" class="btn">Print Summary Report</button>
-        <a href="/admin/salary/reset" class="btn btn-danger" onclick="return confirm('WARNING: This will clear all current attendance logs and advance payments, resetting workers salary data to ₱0 for the next cutoff. Proceed?');">Process Payout & Reset to 0</a>
+        <a href="/admin/salary/reset" class="btn btn-danger" onclick="return confirm('WARNING: This will clear all attendance logs, advance payments, and deductions, resetting workers salary data to ₱0 for the next cutoff. Proceed?');">Process Payout & Reset to 0</a>
       </div>
     </div>
     <div class="card">
       <h3>Worker Salary Breakdown</h3>
       <table>
-        <tr><th>ID</th><th>Name</th><th>Daily Rate</th><th>Total Hours</th><th>Eq. Days</th><th>Gross Salary</th><th>Advance Ded.</th><th>Net Salary</th></tr>
+        <tr><th>ID</th><th>Name</th><th>Daily Rate</th><th>Eq. Days</th><th>Gross Salary</th><th>Advance</th><th>Deductions (Meal, etc.)</th><th>Net Salary</th></tr>
         ${salaryData.map(s => `
           <tr>
             <td>${s.worker_id}</td>
             <td>${s.full_name}</td>
             <td>₱${s.daily_rate}</td>
-            <td>${s.totalWorkingHours} hrs</td>
-            <td>${s.equivalentDays}</td>
+            <td>${s.equivalentDays} (${s.totalWorkingHours} hrs)</td>
             <td>₱${s.totalSalary.toFixed(2)}</td>
             <td>₱${s.totalAdvance.toFixed(2)}</td>
+            <td>₱${s.totalDeductions.toFixed(2)}</td>
             <td><strong>₱${s.netSalary.toFixed(2)}</strong></td>
           </tr>
         `).join('')}
         <tr style="background: #f1f5f9; font-weight: bold;">
-          <td colspan="5" style="text-align: right;">TOTAL:</td>
+          <td colspan="4" style="text-align: right;">TOTAL:</td>
           <td>₱${grandTotalGross.toFixed(2)}</td>
           <td>₱${grandTotalAdvance.toFixed(2)}</td>
+          <td>₱${grandTotalDeductions.toFixed(2)}</td>
           <td>₱${grandTotalNet.toFixed(2)}</td>
         </tr>
       </table>
@@ -681,6 +760,7 @@ app.get('/admin/salary/reset', async (req, res) => {
     await client.query('BEGIN');
     await client.query('DELETE FROM attendance_logs');
     await client.query('DELETE FROM advance_money');
+    await client.query('DELETE FROM deductions');
     await client.query('COMMIT');
   } catch (e) {
     await client.query('ROLLBACK');
@@ -795,6 +875,7 @@ app.get('/worker', async (req, res) => {
   let worker = null;
   let attendance = [];
   let advances = [];
+  let deductions = [];
   let announcements = [];
 
   if (worker_id) {
@@ -805,6 +886,8 @@ app.get('/worker', async (req, res) => {
       attendance = attRes.rows;
       const advRes = await pool.query('SELECT * FROM advance_money WHERE worker_id = $1 ORDER BY advance_date DESC', [worker_id]);
       advances = advRes.rows;
+      const dedRes = await pool.query('SELECT * FROM deductions WHERE worker_id = $1 ORDER BY deduction_date DESC', [worker_id]);
+      deductions = dedRes.rows;
     }
   }
   const annRes = await pool.query('SELECT * FROM announcements ORDER BY created_at DESC LIMIT 5');
@@ -845,11 +928,23 @@ app.get('/worker', async (req, res) => {
         </table>
       </div>
       <div class="card">
-        <h3>My Advances</h3>
-        <table>
-          <tr><th>Date</th><th>Amount</th><th>Notes</th></tr>
-          ${advances.map(ad => `<tr><td>${ad.advance_date.toISOString().split('T')[0]}</td><td>₱${ad.amount}</td><td>${ad.notes || '-'}</td></tr>`).join('')}
-        </table>
+        <h3>My Advances & Deductions</h3>
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px;">
+          <div>
+            <h4>Advances History</h4>
+            <table>
+              <tr><th>Date</th><th>Amount</th></tr>
+              ${advances.map(ad => `<tr><td>${ad.advance_date.toISOString().split('T')[0]}</td><td>₱${ad.amount}</td></tr>`).join('')}
+            </table>
+          </div>
+          <div>
+            <h4>Deductions (Meal, etc.)</h4>
+            <table>
+              <tr><th>Date</th><th>Name</th><th>Amount</th></tr>
+              ${deductions.map(dd => `<tr><td>${dd.deduction_date.toISOString().split('T')[0]}</td><td>${dd.deduction_name}</td><td>₱${dd.amount}</td></tr>`).join('')}
+            </table>
+          </div>
+        </div>
       </div>
       <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
       <script>
@@ -1016,12 +1111,10 @@ app.post('/api/attendance', async (req, res) => {
     }
     const worker = workerRes.rows[0];
     
-    // Get Philippine Time components
     const ph = getPHTime();
     const today = ph.date;
     const timeStr = ph.time;
 
-    // Kunin ang lahat ng logs ngayong araw para sa worker na ito
     const todayLogsRes = await client.query(
       'SELECT * FROM attendance_logs WHERE worker_id = $1 AND attendance_date = $2 ORDER BY attendance_time ASC, id ASC',
       [worker_id, today]

@@ -159,6 +159,11 @@ function layout(title, content, activeTab = '') {
         .badge-success { background: #dcfce7; color: var(--success); }
         .badge-warning { background: #fef3c7; color: var(--warning); }
         .badge-danger { background: #fee2e2; color: var(--danger); }
+        @media print {
+          nav, header, .no-print { display: none !important; }
+          body { background: white; padding: 0; }
+          .card { box-shadow: none; padding: 0; }
+        }
       </style>
     </head>
     <body>
@@ -195,13 +200,13 @@ app.get('/', async (req, res) => {
 // ADMIN PORTAL /admin
 // ==========================================
 const adminNav = `
-  <nav>
+  <nav class="no-print">
     <a href="/admin">Dashboard</a>
     <a href="/admin/workers">Workers</a>
     <a href="/admin/attendance">Attendance</a>
     <a href="/admin/stock">Stock Inventory</a>
     <a href="/admin/advance">Advance Money</a>
-    <a href="/admin/salary">Salary</a>
+    <a href="/admin/salary">Salary & Payroll</a>
     <a href="/admin/announcements">Announcements</a>
     <a href="/admin/settings">Company Settings</a>
     <a href="/admin/schedule">Work Schedule</a>
@@ -259,7 +264,6 @@ app.get('/admin', async (req, res) => {
 
 // Worker Management
 app.get('/admin/workers', async (req, res) => {
-  const settings = await getSettings();
   const search = req.query.search || '';
   const workers = await pool.query('SELECT * FROM workers WHERE full_name ILIKE $1 OR worker_id ILIKE $1 ORDER BY id DESC', [`%${search}%`]);
 
@@ -374,7 +378,7 @@ app.get('/admin/workers/toggle/:worker_id', async (req, res) => {
   res.redirect('/admin/workers');
 });
 
-// Admin Attendance Report
+// Admin Attendance Report & Clear Logs
 app.get('/admin/attendance', async (req, res) => {
   const search = req.query.search || '';
   const dateFilter = req.query.date || '';
@@ -395,11 +399,14 @@ app.get('/admin/attendance', async (req, res) => {
     <header><div class="brand"><h2>Attendance Logs</h2></div></header>
     ${adminNav}
     <div class="card">
-      <form action="/admin/attendance" method="GET" style="display: flex; gap: 10px; margin-bottom: 15px; flex-wrap: wrap;">
-        <input type="text" name="search" placeholder="Worker Name or ID..." value="${search}" style="flex: 1; min-width: 200px;">
-        <input type="date" name="date" value="${dateFilter}" style="width: 200px;">
-        <button type="submit" class="btn" style="height: 42px;">Filter</button>
-      </form>
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; flex-wrap: wrap; gap: 10px;">
+        <form action="/admin/attendance" method="GET" style="display: flex; gap: 10px; flex: 1; min-width: 280px; margin-bottom: 0;">
+          <input type="text" name="search" placeholder="Worker Name or ID..." value="${search}" style="flex: 1;">
+          <input type="date" name="date" value="${dateFilter}" style="width: 180px;">
+          <button type="submit" class="btn" style="height: 42px;">Filter</button>
+        </form>
+        <a href="/admin/attendance/clear" class="btn btn-danger" onclick="return confirm('Are you sure you want to clear ALL attendance logs?');" style="height: 42px; line-height: 22px;">Clear All Logs</a>
+      </div>
       <table>
         <tr><th>Worker ID</th><th>Name</th><th>Date</th><th>Time</th><th>Type</th></tr>
         ${logs.rows.map(l => `<tr><td>${l.worker_id}</td><td>${l.full_name}</td><td>${l.attendance_date.toISOString().split('T')[0]}</td><td>${l.attendance_time}</td><td><span class="badge ${l.attendance_type === 'IN' ? 'badge-success' : 'badge-warning'}">${l.attendance_type}</span></td></tr>`).join('')}
@@ -407,6 +414,11 @@ app.get('/admin/attendance', async (req, res) => {
     </div>
   `;
   res.send(layout('Attendance Report', content));
+});
+
+app.get('/admin/attendance/clear', async (req, res) => {
+  await pool.query('DELETE FROM attendance_logs');
+  res.redirect('/admin/attendance');
 });
 
 // Admin Stock Inventory
@@ -544,29 +556,29 @@ app.post('/admin/advance', async (req, res) => {
   res.redirect('/admin/advance');
 });
 
-// Salary Calculation Report
+// Salary Calculation Report, Summary & Reset to 0
 app.get('/admin/salary', async (req, res) => {
+  const settings = await getSettings();
   const workers = await pool.query('SELECT * FROM workers');
   const scheduleRes = await pool.query('SELECT * FROM work_schedules LIMIT 1');
   const schedule = scheduleRes.rows[0];
 
-  // Calculate stats per worker
   let salaryData = [];
+  let grandTotalGross = 0;
+  let grandTotalAdvance = 0;
+  let grandTotalNet = 0;
+
   for (let w of workers.rows) {
-    // Get all attendance for worker ordered by date and time
     const attRes = await pool.query('SELECT * FROM attendance_logs WHERE worker_id = $1 ORDER BY attendance_date ASC, attendance_time ASC', [w.worker_id]);
     const logs = attRes.rows;
 
     let totalWorkingHours = 0;
-    let pairsCount = 0;
     let i = 0;
     while (i < logs.length) {
       if (logs[i].attendance_type === 'IN') {
         let inTime = logs[i].attendance_time;
-        // Look for next OUT on same date
         if (i + 1 < logs.length && logs[i+1].attendance_type === 'OUT' && logs[i].attendance_date.toISOString() === logs[i+1].attendance_date.toISOString()) {
           let outTime = logs[i+1].attendance_time;
-          // Calculate hours difference
           let [inH, inM] = inTime.split(':').map(Number);
           let [outH, outM] = outTime.split(':').map(Number);
           let diff = (outH + outM / 60) - (inH + inM / 60);
@@ -580,30 +592,49 @@ app.get('/admin/salary', async (req, res) => {
       }
     }
 
-    // Equivalent Days calculation based on full day hours (e.g. 9 hours = 1 day)
     let fullDayHours = parseFloat(schedule.full_day_hours) || 9;
     let equivalentDays = totalWorkingHours / fullDayHours;
     let totalSalary = equivalentDays * parseFloat(w.daily_rate);
 
-    // Get total advances
     const advRes = await pool.query('SELECT SUM(amount) as total_adv FROM advance_money WHERE worker_id = $1', [w.worker_id]);
     let totalAdvance = parseFloat(advRes.rows[0].total_adv) || 0;
     let netSalary = totalSalary - totalAdvance;
+    if (netSalary < 0) netSalary = 0; // Prevent negative payroll if advance exceeds earnings
+
+    grandTotalGross += totalSalary;
+    grandTotalAdvance += totalAdvance;
+    grandTotalNet += netSalary;
 
     salaryData.push({
       ...w,
       totalWorkingHours: totalWorkingHours.toFixed(1),
       equivalentDays: equivalentDays.toFixed(2),
-      totalSalary: totalSalary.toFixed(2),
-      totalAdvance: totalAdvance.toFixed(2),
-      netSalary: netSalary.toFixed(2)
+      totalSalary: totalSalary,
+      totalAdvance: totalAdvance,
+      netSalary: netSalary
     });
   }
 
   let content = `
-    <header><div class="brand"><h2>Salary Payroll Calculation</h2></div></header>
+    <header>
+      <div class="brand">
+        ${settings.company_logo ? `<img src="${settings.company_logo}" alt="Logo">` : ''}
+        <h2>${settings.company_name} - Salary & Payroll Summary</h2>
+      </div>
+    </header>
     ${adminNav}
+    <div class="card" style="display: flex; gap: 15px; flex-wrap: wrap; justify-content: space-between; align-items: center;">
+      <div>
+        <h3>Payroll Summary Overview</h3>
+        <p>Kakailanganing Pera para sa Sahod (Net Payout): <strong style="color: var(--success); font-size: 18px;">₱${grandTotalNet.toFixed(2)}</strong></p>
+      </div>
+      <div style="display: flex; gap: 10px;" class="no-print">
+        <button onclick="window.print()" class="btn">Print Summary Report</button>
+        <a href="/admin/salary/reset" class="btn btn-danger" onclick="return confirm('WARNING: This will clear all current attendance logs and advance payments, resetting workers salary data to ₱0 for the next cutoff. Proceed?');">Process Payout & Reset to 0</a>
+      </div>
+    </div>
     <div class="card">
+      <h3>Worker Salary Breakdown</h3>
       <table>
         <tr><th>ID</th><th>Name</th><th>Daily Rate</th><th>Total Hours</th><th>Eq. Days</th><th>Gross Salary</th><th>Advance Ded.</th><th>Net Salary</th></tr>
         ${salaryData.map(s => `
@@ -613,15 +644,38 @@ app.get('/admin/salary', async (req, res) => {
             <td>₱${s.daily_rate}</td>
             <td>${s.totalWorkingHours} hrs</td>
             <td>${s.equivalentDays}</td>
-            <td>₱${s.totalSalary}</td>
-            <td>₱${s.totalAdvance}</td>
-            <td><strong>₱${s.netSalary}</strong></td>
+            <td>₱${s.totalSalary.toFixed(2)}</td>
+            <td>₱${s.totalAdvance.toFixed(2)}</td>
+            <td><strong>₱${s.netSalary.toFixed(2)}</strong></td>
           </tr>
         `).join('')}
+        <tr style="background: #f1f5f9; font-weight: bold;">
+          <td colspan="5" style="text-align: right;">TOTAL:</td>
+          <td>₱${grandTotalGross.toFixed(2)}</td>
+          <td>₱${grandTotalAdvance.toFixed(2)}</td>
+          <td>₱${grandTotalNet.toFixed(2)}</td>
+        </tr>
       </table>
     </div>
   `;
   res.send(layout('Salary Calculation', content));
+});
+
+// Route to Reset Attendance and Advance Money after Payout
+app.get('/admin/salary/reset', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    // Clear attendance logs and advance money to reset current cycle balances to 0
+    await client.query('DELETE FROM attendance_logs');
+    await client.query('DELETE FROM advance_money');
+    await client.query('COMMIT');
+  } catch (e) {
+    await client.query('ROLLBACK');
+  } finally {
+    client.release();
+  }
+  res.redirect('/admin/salary');
 });
 
 // Announcements Management
@@ -901,7 +955,6 @@ app.get('/scanner', async (req, res) => {
           { facingMode: "environment" },
           { fps: 10, qrbox: { width: 250, height: 250 } },
           async (decodedText) => {
-            // Stop scanning temporarily to process
             await stopScanner();
             processAttendance(decodedText);
           },
@@ -932,7 +985,6 @@ app.get('/scanner', async (req, res) => {
         } else {
           resultDiv.innerHTML = \`<div class="alert-box alert-danger">ERROR: \${data.message}</div>\`;
         }
-        // Auto restart scanner after 3 seconds
         setTimeout(() => {
           resultDiv.innerHTML = '';
           startScanner();
@@ -955,7 +1007,6 @@ app.post('/api/attendance', async (req, res) => {
     const worker = workerRes.rows[0];
     const today = new Date().toISOString().split('T')[0];
 
-    // Get last attendance record for worker today
     const lastAttRes = await client.query(
       'SELECT * FROM attendance_logs WHERE worker_id = $1 AND attendance_date = $2 ORDER BY attendance_time DESC LIMIT 1',
       [worker_id, today]
@@ -963,7 +1014,6 @@ app.post('/api/attendance', async (req, res) => {
 
     const lastRecord = lastAttRes.rows[0];
 
-    // Sequence Validation Rules: IN -> OUT -> IN -> OUT
     if (!lastRecord) {
       if (attendance_type === 'OUT') {
         return res.json({ success: false, message: 'Cannot record TIME OUT as the first attendance.' });
@@ -1044,10 +1094,10 @@ app.post('/scanner/stock-out', async (req, res) => {
   }
   res.redirect('/scanner');
 });
+
 const server = app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
 
-// Increase keepAlive and headers timeout to prevent proxy timeout / 502 errors
-server.keepAliveTimeout = 28800000; // 120 seconds
-server.headersTimeout = 28800000;   // 120 seconds
+server.keepAliveTimeout = 120000;
+server.headersTimeout = 120000;

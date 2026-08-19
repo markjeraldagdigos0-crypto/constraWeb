@@ -570,7 +570,7 @@ app.post('/admin/advance', async (req, res) => {
   res.redirect('/admin/advance');
 });
 
-// Salary Calculation Report, Summary & Reset to 0
+// Salary Calculation Report, Summary & Reset to 0 (Handles 4-scan logs pairs: Morning IN-OUT, Afternoon IN-OUT)
 app.get('/admin/salary', async (req, res) => {
   const settings = await getSettings();
   const workers = await pool.query('SELECT * FROM workers');
@@ -745,7 +745,7 @@ app.get('/admin/settings', async (req, res) => {
 
 app.post('/admin/settings', async (req, res) => {
   const { company_name, company_logo, company_address, contact_number } = req.body;
-  await pool.query('UPDATE company_settings SET company_name = $1, company_logo = $2, company_address = $3, company_address = $3, contact_number = $4 WHERE id = 1',
+  await pool.query('UPDATE company_settings SET company_name = $1, company_logo = $2, company_address = $3, contact_number = $4 WHERE id = 1',
     [company_name, company_logo, company_address, contact_number]);
   res.redirect('/admin/settings');
 });
@@ -885,7 +885,7 @@ app.get('/scanner', async (req, res) => {
     </header>
 
     <div class="card">
-      <h3>Worker QR Attendance Scanner</h3>
+      <h3>Worker QR Attendance Scanner (4-Scans System: Umaga IN/OUT, Hapon IN/OUT)</h3>
       <div style="margin-bottom: 15px; display: flex; gap: 10px;">
         <button onclick="setMode('IN')" id="btnIn" class="btn" style="flex: 1;">SELECT TIME IN</button>
         <button onclick="setMode('OUT')" id="btnOut" class="btn btn-warning" style="flex: 1;">SELECT TIME OUT</button>
@@ -991,7 +991,7 @@ app.get('/scanner', async (req, res) => {
         const data = await res.json();
         const resultDiv = document.getElementById('scanResult');
         if (data.success) {
-          resultDiv.innerHTML = \`<div class="alert-box alert-success">SUCCESS!<br>\${data.worker.full_name}<br>Worker ID: \${data.worker.worker_id}<br>TIME \${currentMode}<br>\${data.date} \${data.time}</div>\`;
+          resultDiv.innerHTML = \`<div class="alert-box alert-success">SUCCESS! (\${data.stepDescription})<br>\${data.worker.full_name}<br>ID: \${data.worker.worker_id}<br>TIME \${currentMode}<br>\${data.date} \${data.time}</div>\`;
         } else {
           resultDiv.innerHTML = \`<div class="alert-box alert-danger">ERROR: \${data.message}</div>\`;
         }
@@ -1005,7 +1005,7 @@ app.get('/scanner', async (req, res) => {
   res.send(layout('Scanner Portal', content));
 });
 
-// API Endpoint for QR Attendance Processing using Philippine Time (PST)
+// API Endpoint for Strict 4-Scans Sequence (1: Umaga IN, 2: Umaga OUT, 3: Hapon IN, 4: Hapon OUT)
 app.post('/api/attendance', async (req, res) => {
   const { worker_id, attendance_type } = req.body;
   const client = await pool.connect();
@@ -1021,24 +1021,37 @@ app.post('/api/attendance', async (req, res) => {
     const today = ph.date;
     const timeStr = ph.time;
 
-    const lastAttRes = await client.query(
-      'SELECT * FROM attendance_logs WHERE worker_id = $1 AND attendance_date = $2 ORDER BY attendance_time DESC LIMIT 1',
+    // Kunin ang lahat ng logs ngayong araw para sa worker na ito
+    const todayLogsRes = await client.query(
+      'SELECT * FROM attendance_logs WHERE worker_id = $1 AND attendance_date = $2 ORDER BY attendance_time ASC, id ASC',
       [worker_id, today]
     );
+    const logsCount = todayLogsRes.rows.length;
 
-    const lastRecord = lastAttRes.rows[0];
+    let expectedType = '';
+    let stepDescription = '';
 
-    if (!lastRecord) {
-      if (attendance_type === 'OUT') {
-        return res.json({ success: false, message: 'Cannot record TIME OUT as the first attendance.' });
-      }
+    if (logsCount === 0) {
+      expectedType = 'IN';
+      stepDescription = '1st Scan: Umaga Time IN';
+    } else if (logsCount === 1) {
+      expectedType = 'OUT';
+      stepDescription = '2nd Scan: Umaga Time OUT (Lunch Break)';
+    } else if (logsCount === 2) {
+      expectedType = 'IN';
+      stepDescription = '3rd Scan: Hapon Time IN';
+    } else if (logsCount === 3) {
+      expectedType = 'OUT';
+      stepDescription = '4th Scan: Hapon Time OUT (Uwian)';
     } else {
-      if (lastRecord.attendance_type === 'IN' && attendance_type === 'IN') {
-        return res.json({ success: false, message: 'Cannot record two consecutive TIME IN records.' });
-      }
-      if (lastRecord.attendance_type === 'OUT' && attendance_type === 'OUT') {
-        return res.json({ success: false, message: 'Cannot record two consecutive TIME OUT records.' });
-      }
+      return res.json({ success: false, message: 'Tapos na ang 4 na beses na pag-scan mo ngayong araw (Complete na ang Umaga at Hapon).' });
+    }
+
+    if (attendance_type !== expectedType) {
+      return res.json({ 
+        success: false, 
+        message: `Maling pindot! Ang sunod na kailangan mong i-scan ngayon ay ${expectedType} (${stepDescription}).` 
+      });
     }
 
     await client.query(
@@ -1046,7 +1059,7 @@ app.post('/api/attendance', async (req, res) => {
       [worker_id, today, timeStr, attendance_type]
     );
 
-    res.json({ success: true, worker, date: today, time: timeStr });
+    res.json({ success: true, worker, date: today, time: timeStr, stepDescription });
   } catch (err) {
     res.json({ success: false, message: 'Server error during attendance recording.' });
   } finally {

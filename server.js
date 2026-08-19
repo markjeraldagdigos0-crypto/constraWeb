@@ -77,6 +77,7 @@ async function initDB() {
       CREATE TABLE IF NOT EXISTS workers (
         id SERIAL PRIMARY KEY,
         worker_id VARCHAR(50) UNIQUE NOT NULL,
+        password TEXT NOT NULL,
         full_name VARCHAR(255) NOT NULL,
         position VARCHAR(100) NOT NULL,
         contact_number VARCHAR(50),
@@ -85,13 +86,6 @@ async function initDB() {
         profile_picture TEXT,
         status VARCHAR(20) DEFAULT 'Active',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
-
-      CREATE TABLE IF NOT EXISTS worker_accounts (
-        id SERIAL PRIMARY KEY,
-        worker_id VARCHAR(50) UNIQUE NOT NULL,
-        password TEXT NOT NULL,
-        FOREIGN KEY (worker_id) REFERENCES workers(worker_id) ON DELETE CASCADE
       );
 
       CREATE TABLE IF NOT EXISTS attendance_logs (
@@ -160,14 +154,6 @@ function requireAdmin(req, res, next) {
   res.redirect('/admin/login');
 }
 
-// Middleware to protect Worker Routes
-function requireWorker(req, res, next) {
-  if (req.session && req.session.workerId) {
-    return next();
-  }
-  res.redirect('/worker/login');
-}
-
 function layout(title, content) {
   return `
     <!DOCTYPE html>
@@ -231,7 +217,7 @@ app.get('/', async (req, res) => {
     <div style="text-align: center; padding: 40px 20px;">
       ${settings.company_logo ? `<img src="${settings.company_logo}" alt="Logo" style="max-height: 80px; margin-bottom: 15px;">` : ''}
       <h1 style="font-size: 32px; margin-bottom: 10px;">${settings.company_name}</h1>
-      <p style="color: #64748b; margin-bottom: 30px;">Construction Worker Attendance & Payroll System</p>
+      <p style="color: #64748b; margin-bottom: 30px;">Construction Worker Management System</p>
       
       <div style="display: flex; justify-content: center; gap: 20px; flex-wrap: wrap;">
         <a href="/admin/login" class="btn" style="padding: 20px 40px; font-size: 18px;">ADMIN PORTAL</a>
@@ -420,6 +406,7 @@ app.get('/admin/workers', requireAdmin, async (req, res) => {
               <a href="/admin/workers/qr/${w.worker_id}" class="btn" style="padding: 4px 8px; font-size: 12px;">QR Code</a>
               <a href="/admin/workers/edit/${w.worker_id}" class="btn btn-warning" style="padding: 4px 8px; font-size: 12px;">Edit</a>
               <a href="/admin/workers/toggle/${w.worker_id}" class="btn ${w.status === 'Active' ? 'btn-danger' : 'btn-success'}" style="padding: 4px 8px; font-size: 12px;">${w.status === 'Active' ? 'Deactivate' : 'Activate'}</a>
+              <a href="/admin/workers/delete/${w.worker_id}" class="btn btn-danger" onclick="return confirm('Are you sure you want to delete worker ${w.full_name}?');" style="padding: 4px 8px; font-size: 12px;">Delete</a>
             </td>
           </tr>
         `).join('')}
@@ -439,12 +426,10 @@ app.get('/admin/workers/register', requireAdmin, async (req, res) => {
     ${adminNav}
     <div class="card">
       <form action="/admin/workers/register" method="POST">
-        <label>Worker ID (Auto Generated)</label>
+        <label>Worker ID (Auto Generated - Default password will be same as ID)</label>
         <input type="text" name="worker_id" value="${autoWorkerId}" readonly style="background: #e2e8f0;">
         <label>Full Name</label>
         <input type="text" name="full_name" required>
-        <label>Portal Password (Para sa Worker Portal Login)</label>
-        <input type="password" name="password" required>
         <label>Position</label>
         <input type="text" name="position" required>
         <label>Contact Number</label>
@@ -461,22 +446,11 @@ app.get('/admin/workers/register', requireAdmin, async (req, res) => {
 });
 
 app.post('/admin/workers/register', requireAdmin, async (req, res) => {
-  const { worker_id, full_name, password, position, contact_number, daily_rate, assigned_project } = req.body;
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    await client.query('INSERT INTO workers (worker_id, full_name, position, contact_number, daily_rate, assigned_project) VALUES ($1, $2, $3, $4, $5, $6)',
-      [worker_id, full_name, position, contact_number, daily_rate, assigned_project]);
-    
-    const hashedPassword = await bcrypt.hash(password, 10);
-    await client.query('INSERT INTO worker_accounts (worker_id, password) VALUES ($1, $2)', [worker_id, hashedPassword]);
-    
-    await client.query('COMMIT');
-  } catch (e) {
-    await client.query('ROLLBACK');
-  } finally {
-    client.release();
-  }
+  const { worker_id, full_name, position, contact_number, daily_rate, assigned_project } = req.body;
+  // Default password is set to worker_id (e.g. W-0001)
+  const defaultPassword = await bcrypt.hash(worker_id, 10);
+  await pool.query('INSERT INTO workers (worker_id, password, full_name, position, contact_number, daily_rate, assigned_project) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+    [worker_id, defaultPassword, full_name, position, contact_number, daily_rate, assigned_project]);
   res.redirect(`/admin/workers/qr/${worker_id}`);
 });
 
@@ -496,7 +470,8 @@ app.get('/admin/workers/qr/:worker_id', requireAdmin, async (req, res) => {
       <hr style="margin: 10px 0;">
       <h2 style="margin: 10px 0;">${worker.full_name}</h2>
       <p style="font-size: 16px; font-weight: bold; color: var(--accent);">ID: ${worker.worker_id}</p>
-      <p style="margin-bottom: 15px;">Position: ${worker.position}</p>
+      <p style="margin-bottom: 5px;">Position: ${worker.position}</p>
+      <p style="margin-bottom: 15px; font-size: 13px; color: #64748b;">Default Portal Password: <strong>${worker.worker_id}</strong></p>
       <div id="qrcode" style="display: flex; justify-content: center; margin: 20px 0;"></div>
       <button onclick="window.print()" class="btn">Print QR Code</button>
       <a href="/admin/workers" class="btn btn-warning">Back to Workers</a>
@@ -519,6 +494,25 @@ app.get('/admin/workers/toggle/:worker_id', requireAdmin, async (req, res) => {
   if (workerRes.rows.length > 0) {
     const newStatus = workerRes.rows[0].status === 'Active' ? 'Inactive' : 'Active';
     await pool.query('UPDATE workers SET status = $1 WHERE worker_id = $2', [newStatus, worker_id]);
+  }
+  res.redirect('/admin/workers');
+});
+
+// Delete Worker Route
+app.get('/admin/workers/delete/:worker_id', requireAdmin, async (req, res) => {
+  const { worker_id } = req.params;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('DELETE FROM attendance_logs WHERE worker_id = $1', [worker_id]);
+    await client.query('DELETE FROM advance_money WHERE worker_id = $1', [worker_id]);
+    await client.query('DELETE FROM deductions WHERE worker_id = $1', [worker_id]);
+    await client.query('DELETE FROM workers WHERE worker_id = $1', [worker_id]);
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+  } finally {
+    client.release();
   }
   res.redirect('/admin/workers');
 });
@@ -886,7 +880,7 @@ app.post('/admin/schedule', requireAdmin, async (req, res) => {
 
 
 // ==========================================
-// WORKER AUTHENTICATION & PORTAL /worker
+// WORKER PORTAL /worker (With Password Protection)
 // ==========================================
 app.get('/worker/login', async (req, res) => {
   const settings = await getSettings();
@@ -896,12 +890,15 @@ app.get('/worker/login', async (req, res) => {
       <h2 style="text-align: center; margin-bottom: 20px;">Worker Portal Login</h2>
       ${error ? `<div class="alert-box alert-danger">${error}</div>` : ''}
       <form action="/worker/login" method="POST">
-        <label>Worker ID (e.g. W-0001)</label>
-        <input type="text" name="worker_id" required>
+        <label>Worker ID</label>
+        <input type="text" name="worker_id" placeholder="e.g. W-0001" required>
         <label>Password</label>
         <input type="password" name="password" required>
-        <button type="submit" class="btn btn-success" style="width: 100%; padding: 12px; margin-bottom: 15px;">Login Portal</button>
+        <button type="submit" class="btn btn-success" style="width: 100%; padding: 12px; margin-bottom: 15px;">Login</button>
       </form>
+      <div style="text-align: center; font-size: 13px; color: #64748b;">
+        *Note: Kung bagong rehistro ka, ang default password mo ay ang iyong Worker ID mismo.
+      </div>
     </div>
   `;
   res.send(layout(settings.company_name + ' - Worker Login', content));
@@ -910,17 +907,17 @@ app.get('/worker/login', async (req, res) => {
 app.post('/worker/login', async (req, res) => {
   const { worker_id, password } = req.body;
   try {
-    const accRes = await pool.query('SELECT * FROM worker_accounts WHERE worker_id = $1', [worker_id]);
-    if (accRes.rows.length === 0) {
+    const result = await pool.query('SELECT * FROM workers WHERE worker_id = $1', [worker_id]);
+    if (result.rows.length === 0) {
       return res.redirect('/worker/login?error=Invalid Worker ID or Password.');
     }
-    const account = accRes.rows[0];
-    const match = await bcrypt.compare(password, account.password);
+    const worker = result.rows[0];
+    const match = await bcrypt.compare(password, worker.password);
     if (!match) {
       return res.redirect('/worker/login?error=Invalid Worker ID or Password.');
     }
 
-    req.session.workerId = account.worker_id;
+    req.session.workerId = worker.worker_id;
     res.redirect('/worker');
   } catch (err) {
     res.redirect('/worker/login?error=Server error during login.');
@@ -933,25 +930,31 @@ app.get('/worker/logout', (req, res) => {
   });
 });
 
-app.get('/worker', requireWorker, async (req, res) => {
+app.get('/worker', async (req, res) => {
+  if (!req.session || !req.session.workerId) {
+    return res.redirect('/worker/login');
+  }
+
   const settings = await getSettings();
   const worker_id = req.session.workerId;
-  
+  let worker = null;
+  let attendance = [];
+  let advances = [];
+  let deductions = [];
+  let announcements = [];
+
   const wRes = await pool.query('SELECT * FROM workers WHERE worker_id = $1', [worker_id]);
-  if (wRes.rows.length === 0) return res.redirect('/worker/logout');
-  const worker = wRes.rows[0];
-
-  const attRes = await pool.query('SELECT * FROM attendance_logs WHERE worker_id = $1 ORDER BY attendance_date DESC, attendance_time DESC LIMIT 20', [worker_id]);
-  const attendance = attRes.rows;
-
-  const advRes = await pool.query('SELECT * FROM advance_money WHERE worker_id = $1 ORDER BY advance_date DESC', [worker_id]);
-  const advances = advRes.rows;
-
-  const dedRes = await pool.query('SELECT * FROM deductions WHERE worker_id = $1 ORDER BY deduction_date DESC', [worker_id]);
-  const deductions = dedRes.rows;
-
+  if (wRes.rows.length > 0) {
+    worker = wRes.rows[0];
+    const attRes = await pool.query('SELECT * FROM attendance_logs WHERE worker_id = $1 ORDER BY attendance_date DESC, attendance_time DESC LIMIT 20', [worker_id]);
+    attendance = attRes.rows;
+    const advRes = await pool.query('SELECT * FROM advance_money WHERE worker_id = $1 ORDER BY advance_date DESC', [worker_id]);
+    advances = advRes.rows;
+    const dedRes = await pool.query('SELECT * FROM deductions WHERE worker_id = $1 ORDER BY deduction_date DESC', [worker_id]);
+    deductions = dedRes.rows;
+  }
   const annRes = await pool.query('SELECT * FROM announcements ORDER BY created_at DESC LIMIT 5');
-  const announcements = annRes.rows;
+  announcements = annRes.rows;
 
   let content = `
     <header>
@@ -960,54 +963,56 @@ app.get('/worker', requireWorker, async (req, res) => {
         <h2>${settings.company_name} - Worker Portal</h2>
       </div>
       <div>
-        <a href="/worker/logout" class="btn btn-danger" style="padding: 6px 12px; font-size: 12px;">Logout</a>
+        <a href="/worker/logout" class="btn btn-danger" style="padding: 6px 12px; font-size: 13px;">Logout</a>
       </div>
     </header>
-    <div class="card">
-      <h3>Welcome, ${worker.full_name} (${worker.worker_id})</h3>
-      <p><strong>Position:</strong> ${worker.position}</p>
-      <p><strong>Assigned Project:</strong> ${worker.assigned_project || '-'}</p>
-      <p><strong>Daily Rate:</strong> ₱${worker.daily_rate}</p>
-    </div>
-    <div class="card" style="text-align: center;">
-      <h3>My QR Code</h3>
-      <div id="qrcode" style="display: flex; justify-content: center; margin: 15px 0;"></div>
-      <p><strong>${worker.worker_id}</strong></p>
-    </div>
-    <div class="card">
-      <h3>My Recent Attendance</h3>
-      <table>
-        <tr><th>Date</th><th>Time</th><th>Type</th></tr>
-        ${attendance.map(a => `<tr><td>${a.attendance_date.toISOString().split('T')[0]}</td><td>${a.attendance_time}</td><td><span class="badge ${a.attendance_type === 'IN' ? 'badge-success' : 'badge-warning'}">${a.attendance_type}</span></td></tr>`).join('')}
-      </table>
-    </div>
-    <div class="card">
-      <h3>My Advances & Deductions</h3>
-      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px;">
-        <div>
-          <h4>Advances History</h4>
-          <table>
-            <tr><th>Date</th><th>Amount</th></tr>
-            ${advances.map(ad => `<tr><td>${ad.advance_date.toISOString().split('T')[0]}</td><td>₱${ad.amount}</td></tr>`).join('')}
-          </table>
-        </div>
-        <div>
-          <h4>Deductions (Meal, etc.)</h4>
-          <table>
-            <tr><th>Date</th><th>Name</th><th>Amount</th></tr>
-            ${deductions.map(dd => `<tr><td>${dd.deduction_date.toISOString().split('T')[0]}</td><td>${dd.deduction_name}</td><td>₱${dd.amount}</td></tr>`).join('')}
-          </table>
+    ${worker ? `
+      <div class="card">
+        <h3>Welcome, ${worker.full_name} (${worker.worker_id})</h3>
+        <p><strong>Position:</strong> ${worker.position}</p>
+        <p><strong>Assigned Project:</strong> ${worker.assigned_project || '-'}</p>
+        <p><strong>Daily Rate:</strong> ₱${worker.daily_rate}</p>
+      </div>
+      <div class="card" style="text-align: center;">
+        <h3>My QR Code</h3>
+        <div id="qrcode" style="display: flex; justify-content: center; margin: 15px 0;"></div>
+        <p><strong>${worker.worker_id}</strong></p>
+      </div>
+      <div class="card">
+        <h3>My Recent Attendance</h3>
+        <table>
+          <tr><th>Date</th><th>Time</th><th>Type</th></tr>
+          ${attendance.map(a => `<tr><td>${a.attendance_date.toISOString().split('T')[0]}</td><td>${a.attendance_time}</td><td><span class="badge ${a.attendance_type === 'IN' ? 'badge-success' : 'badge-warning'}">${a.attendance_type}</span></td></tr>`).join('')}
+        </table>
+      </div>
+      <div class="card">
+        <h3>My Advances & Deductions</h3>
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px;">
+          <div>
+            <h4>Advances History</h4>
+            <table>
+              <tr><th>Date</th><th>Amount</th></tr>
+              ${advances.map(ad => `<tr><td>${ad.advance_date.toISOString().split('T')[0]}</td><td>₱${ad.amount}</td></tr>`).join('')}
+            </table>
+          </div>
+          <div>
+            <h4>Deductions (Meal, etc.)</h4>
+            <table>
+              <tr><th>Date</th><th>Name</th><th>Amount</th></tr>
+              ${deductions.map(dd => `<tr><td>${dd.deduction_date.toISOString().split('T')[0]}</td><td>${dd.deduction_name}</td><td>₱${dd.amount}</td></tr>`).join('')}
+            </table>
+          </div>
         </div>
       </div>
-    </div>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
-    <script>
-      new QRCode(document.getElementById("qrcode"), {
-        text: "${worker.worker_id}",
-        width: 150,
-        height: 150
-      });
-    </script>
+      <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+      <script>
+        new QRCode(document.getElementById("qrcode"), {
+          text: "${worker.worker_id}",
+          width: 150,
+          height: 150
+        });
+      </script>
+    ` : ''}
     <div class="card">
       <h3>Announcements</h3>
       ${announcements.map(a => `<div style="border-bottom: 1px solid #cbd5e1; padding: 10px 0;"><h4>${a.title}</h4><p>${a.content}</p></div>`).join('')}
@@ -1018,7 +1023,7 @@ app.get('/worker', requireWorker, async (req, res) => {
 
 
 // ==========================================
-// SCANNER PORTAL /scanner
+// SCANNER PORTAL /scanner (Stock Inventory removed)
 // ==========================================
 app.get('/scanner', async (req, res) => {
   const settings = await getSettings();

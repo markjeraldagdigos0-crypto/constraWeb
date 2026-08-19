@@ -44,10 +44,14 @@ async function initDB() {
 
       CREATE TABLE IF NOT EXISTS work_schedules (
         id SERIAL PRIMARY KEY,
-        morning_start VARCHAR(10) DEFAULT '07:00',
-        morning_end VARCHAR(10) DEFAULT '12:00',
-        afternoon_start VARCHAR(10) DEFAULT '13:00',
-        afternoon_end VARCHAR(10) DEFAULT '17:00',
+        morning_in_start VARCHAR(10) DEFAULT '06:00',
+        morning_in_end VARCHAR(10) DEFAULT '07:00',
+        morning_out_start VARCHAR(10) DEFAULT '11:30',
+        morning_out_end VARCHAR(10) DEFAULT '12:00',
+        afternoon_in_start VARCHAR(10) DEFAULT '12:00',
+        afternoon_in_end VARCHAR(10) DEFAULT '13:00',
+        afternoon_out_start VARCHAR(10) DEFAULT '17:00',
+        afternoon_out_end VARCHAR(18:00',
         full_day_hours NUMERIC DEFAULT 9,
         half_day_hours NUMERIC DEFAULT 4.5
       );
@@ -129,7 +133,6 @@ async function initDB() {
     if (settingsCheck.rows.length === 0) {
       await pool.query('INSERT INTO company_settings (company_name, default_meal_deduction) VALUES ($1, $2)', ['BuildCorp Construction', 50.00]);
     } else {
-      // Check if column exists, if not add it safely
       try {
         await pool.query('ALTER TABLE company_settings ADD COLUMN IF NOT EXISTS default_meal_deduction NUMERIC(10,2) DEFAULT 50.00');
       } catch(e) {}
@@ -137,7 +140,19 @@ async function initDB() {
 
     const scheduleCheck = await pool.query('SELECT * FROM work_schedules');
     if (scheduleCheck.rows.length === 0) {
-      await pool.query('INSERT INTO work_schedules DEFAULT VALUES');
+      await pool.query(`INSERT INTO work_schedules (morning_in_start, morning_in_end, morning_out_start, morning_out_end, afternoon_in_start, afternoon_in_end, afternoon_out_start, afternoon_out_end) 
+        VALUES ('06:00', '07:00', '11:30', '12:00', '12:00', '13:00', '17:00', '18:00')`);
+    } else {
+      try {
+        await pool.query('ALTER TABLE work_schedules ADD COLUMN IF NOT EXISTS morning_in_start VARCHAR(10) DEFAULT \'06:00\'');
+        await pool.query('ALTER TABLE work_schedules ADD COLUMN IF NOT EXISTS morning_in_end VARCHAR(10) DEFAULT \'07:00\'');
+        await pool.query('ALTER TABLE work_schedules ADD COLUMN IF NOT EXISTS morning_out_start VARCHAR(10) DEFAULT \'11:30\'');
+        await pool.query('ALTER TABLE work_schedules ADD COLUMN IF NOT EXISTS morning_out_end VARCHAR(10) DEFAULT \'12:00\'');
+        await pool.query('ALTER TABLE work_schedules ADD COLUMN IF NOT EXISTS afternoon_in_start VARCHAR(10) DEFAULT \'12:00\'');
+        await pool.query('ALTER TABLE work_schedules ADD COLUMN IF NOT EXISTS afternoon_in_end VARCHAR(10) DEFAULT \'13:00\'');
+        await pool.query('ALTER TABLE work_schedules ADD COLUMN IF NOT EXISTS afternoon_out_start VARCHAR(10) DEFAULT \'17:00\'');
+        await pool.query('ALTER TABLE work_schedules ADD COLUMN IF NOT EXISTS afternoon_out_end VARCHAR(10) DEFAULT \'18:00\'');
+      } catch(e) {}
     }
     console.log('Database initialized successfully.');
   } catch (err) {
@@ -240,7 +255,7 @@ const adminNav = `
     <a href="/admin/salary">Salary & Payroll</a>
     <a href="/admin/announcements">Announcements</a>
     <a href="/admin/settings">Company Settings</a>
-    <a href="/admin/schedule">Work Schedule</a>
+    <a href="/admin/schedule">Work Schedule & Time Windows</a>
   </nav>
 `;
 
@@ -646,12 +661,10 @@ app.post('/admin/deductions', async (req, res) => {
   res.redirect('/admin/deductions');
 });
 
-// Salary Calculation Report, Summary & Reset to 0 (Handles 4-scan logs pairs + Advances + Deductions)
+// Salary Calculation Report (Per Day / Full Day or Half Day Logic)
 app.get('/admin/salary', async (req, res) => {
   const settings = await getSettings();
   const workers = await pool.query('SELECT * FROM workers');
-  const scheduleRes = await pool.query('SELECT * FROM work_schedules LIMIT 1');
-  const schedule = scheduleRes.rows[0];
 
   let salaryData = [];
   let grandTotalGross = 0;
@@ -660,32 +673,23 @@ app.get('/admin/salary', async (req, res) => {
   let grandTotalNet = 0;
 
   for (let w of workers.rows) {
-    const attRes = await pool.query('SELECT * FROM attendance_logs WHERE worker_id = $1 ORDER BY attendance_date ASC, attendance_time ASC', [w.worker_id]);
-    const logs = attRes.rows;
-
-    let totalWorkingHours = 0;
-    let i = 0;
-    while (i < logs.length) {
-      if (logs[i].attendance_type === 'IN') {
-        let inTime = logs[i].attendance_time;
-        if (i + 1 < logs.length && logs[i+1].attendance_type === 'OUT' && logs[i].attendance_date.toISOString() === logs[i+1].attendance_date.toISOString()) {
-          let outTime = logs[i+1].attendance_time;
-          let [inH, inM] = inTime.split(':').map(Number);
-          let [outH, outM] = outTime.split(':').map(Number);
-          let diff = (outH + outM / 60) - (inH + inM / 60);
-          if (diff > 0) totalWorkingHours += diff;
-          i += 2;
-        } else {
-          i++;
-        }
-      } else {
-        i++;
+    // Group attendance logs by date to check if Full Day (4 scans) or Half Day (2 scans)
+    const attRes = await pool.query(
+      'SELECT attendance_date, COUNT(*) as scan_count FROM attendance_logs WHERE worker_id = $1 GROUP BY attendance_date', 
+      [w.worker_id]
+    );
+    
+    let totalEquivalentDays = 0;
+    for (let row of attRes.rows) {
+      let scans = parseInt(row.scan_count);
+      if (scans >= 4) {
+        totalEquivalentDays += 1.0; // Full day
+      } else if (scans >= 2) {
+        totalEquivalentDays += 0.5; // Half day
       }
     }
 
-    let fullDayHours = parseFloat(schedule.full_day_hours) || 9;
-    let equivalentDays = totalWorkingHours / fullDayHours;
-    let totalSalary = equivalentDays * parseFloat(w.daily_rate);
+    let totalSalary = totalEquivalentDays * parseFloat(w.daily_rate);
 
     // Get total advance money
     const advRes = await pool.query('SELECT SUM(amount) as total_adv FROM advance_money WHERE worker_id = $1', [w.worker_id]);
@@ -705,8 +709,7 @@ app.get('/admin/salary', async (req, res) => {
 
     salaryData.push({
       ...w,
-      totalWorkingHours: totalWorkingHours.toFixed(1),
-      equivalentDays: equivalentDays.toFixed(2),
+      totalEquivalentDays: totalEquivalentDays.toFixed(1),
       totalSalary: totalSalary,
       totalAdvance: totalAdvance,
       totalDeductions: totalDeductions,
@@ -718,7 +721,7 @@ app.get('/admin/salary', async (req, res) => {
     <header>
       <div class="brand">
         ${settings.company_logo ? `<img src="${settings.company_logo}" alt="Logo">` : ''}
-        <h2>${settings.company_name} - Salary & Payroll Summary</h2>
+        <h2>${settings.company_name} - Salary & Payroll Summary (Per Day Calculation)</h2>
       </div>
     </header>
     ${adminNav}
@@ -735,13 +738,13 @@ app.get('/admin/salary', async (req, res) => {
     <div class="card">
       <h3>Worker Salary Breakdown</h3>
       <table>
-        <tr><th>ID</th><th>Name</th><th>Daily Rate</th><th>Eq. Days</th><th>Gross Salary</th><th>Advance</th><th>Deductions (Meal, etc.)</th><th>Net Salary</th></tr>
+        <tr><th>ID</th><th>Name</th><th>Daily Rate</th><th>Total Days Worked (Full/Half)</th><th>Gross Salary</th><th>Advance</th><th>Deductions (Meal, etc.)</th><th>Net Salary</th></tr>
         ${salaryData.map(s => `
           <tr>
             <td>${s.worker_id}</td>
             <td>${s.full_name}</td>
             <td>₱${s.daily_rate}</td>
-            <td>${s.equivalentDays} (${s.totalWorkingHours} hrs)</td>
+            <td>${s.totalEquivalentDays} days</td>
             <td>₱${s.totalSalary.toFixed(2)}</td>
             <td>₱${s.totalAdvance.toFixed(2)}</td>
             <td>₱${s.totalDeductions.toFixed(2)}</td>
@@ -834,33 +837,41 @@ app.get('/admin/settings', async (req, res) => {
 
 app.post('/admin/settings', async (req, res) => {
   const { company_name, company_logo, company_address, contact_number, default_meal_deduction } = req.body;
-  await pool.query('UPDATE company_settings SET company_name = $1, company_logo = $2, company_address = $3, contact_number = $4, default_meal_deduction = $5 WHERE id = 1',
+  await pool.query('UPDATE company_settings SET company_name = $1, company_logo = $2, company_address = $3, company_number = $4, default_meal_deduction = $5 WHERE id = 1',
     [company_name, company_logo, company_address, contact_number, default_meal_deduction]);
   res.redirect('/admin/settings');
 });
 
-// Work Schedule
+// Work Schedule & Time Windows Configuration
 app.get('/admin/schedule', async (req, res) => {
   const schedRes = await pool.query('SELECT * FROM work_schedules LIMIT 1');
   const sched = schedRes.rows[0];
   let content = `
-    <header><div class="brand"><h2>Work Schedule Configuration</h2></div></header>
+    <header><div class="brand"><h2>Work Schedule & Time Windows</h2></div></header>
     ${adminNav}
     <div class="card">
       <form action="/admin/schedule" method="POST">
-        <label>Morning Start</label>
-        <input type="text" name="morning_start" value="${sched.morning_start}">
-        <label>Morning End</label>
-        <input type="text" name="morning_end" value="${sched.morning_end}">
-        <label>Afternoon Start</label>
-        <input type="text" name="afternoon_start" value="${sched.afternoon_start}">
-        <label>Afternoon End</label>
-        <input type="text" name="afternoon_end" value="${sched.afternoon_end}">
-        <label>Full Day Hours</label>
-        <input type="number" step="0.5" name="full_day_hours" value="${sched.full_day_hours}">
-        <label>Half Day Hours</label>
-        <input type="number" step="0.5" name="half_day_hours" value="${sched.half_day_hours}">
-        <button type="submit" class="btn btn-success">Save Schedule</button>
+        <h3>Morning Session Time Windows</h3>
+        <div style="display: flex; gap: 15px;">
+          <div style="flex:1;"><label>Time IN Start</label><input type="time" name="morning_in_start" value="${sched.morning_in_start || '06:00'}"></div>
+          <div style="flex:1;"><label>Time IN End</label><input type="time" name="morning_in_end" value="${sched.morning_in_end || '07:00'}"></div>
+        </div>
+        <div style="display: flex; gap: 15px;">
+          <div style="flex:1;"><label>Time OUT Start</label><input type="time" name="morning_out_start" value="${sched.morning_out_start || '11:30'}"></div>
+          <div style="flex:1;"><label>Time OUT End</label><input type="time" name="morning_out_end" value="${sched.morning_out_end || '12:00'}"></div>
+        </div>
+
+        <h3 style="margin-top: 20px;">Afternoon Session Time Windows</h3>
+        <div style="display: flex; gap: 15px;">
+          <div style="flex:1;"><label>Time IN Start</label><input type="time" name="afternoon_in_start" value="${sched.afternoon_in_start || '12:00'}"></div>
+          <div style="flex:1;"><label>Time IN End</label><input type="time" name="afternoon_in_end" value="${sched.afternoon_in_end || '13:00'}"></div>
+        </div>
+        <div style="display: flex; gap: 15px;">
+          <div style="flex:1;"><label>Time OUT Start</label><input type="time" name="afternoon_out_start" value="${sched.afternoon_out_start || '17:00'}"></div>
+          <div style="flex:1;"><label>Time OUT End</label><input type="time" name="afternoon_out_end" value="${sched.afternoon_out_end || '18:00'}"></div>
+        </div>
+
+        <button type="submit" class="btn btn-success" style="margin-top: 20px;">Save Schedule Windows</button>
       </form>
     </div>
   `;
@@ -868,9 +879,9 @@ app.get('/admin/schedule', async (req, res) => {
 });
 
 app.post('/admin/schedule', async (req, res) => {
-  const { morning_start, morning_end, afternoon_start, afternoon_end, full_day_hours, half_day_hours } = req.body;
-  await pool.query('UPDATE work_schedules SET morning_start = $1, morning_end = $2, afternoon_start = $3, afternoon_end = $4, full_day_hours = $5, half_day_hours = $6 WHERE id = 1',
-    [morning_start, morning_end, afternoon_start, afternoon_end, full_day_hours, half_day_hours]);
+  const { morning_in_start, morning_in_end, morning_out_start, morning_out_end, afternoon_in_start, afternoon_in_end, afternoon_out_start, afternoon_out_end } = req.body;
+  await pool.query(`UPDATE work_schedules SET morning_in_start = $1, morning_in_end = $2, morning_out_start = $3, morning_out_end = $4, afternoon_in_start = $5, afternoon_in_end = $6, afternoon_out_start = $7, afternoon_out_end = $8 WHERE id = 1`,
+    [morning_in_start, morning_in_end, morning_out_start, morning_out_end, afternoon_in_start, afternoon_in_end, afternoon_out_start, afternoon_out_end]);
   res.redirect('/admin/schedule');
 });
 
@@ -989,7 +1000,7 @@ app.get('/scanner', async (req, res) => {
     </header>
 
     <div class="card">
-      <h3>Worker QR Attendance Scanner (4-Scans System: Umaga IN/OUT, Hapon IN/OUT)</h3>
+      <h3>Worker QR Attendance Scanner (Time Window Validated & Meal Deduction)</h3>
       <div style="margin-bottom: 15px; display: flex; gap: 10px;">
         <button onclick="setMode('IN')" id="btnIn" class="btn" style="flex: 1;">SELECT TIME IN</button>
         <button onclick="setMode('OUT')" id="btnOut" class="btn btn-warning" style="flex: 1;">SELECT TIME OUT</button>
@@ -1101,7 +1112,6 @@ app.get('/scanner', async (req, res) => {
       }
 
       async function checkAttendanceAndPromptMeal(workerId) {
-        // Step 1: Validate attendance first via backend API
         const res = await fetch('/api/attendance/check', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -1115,11 +1125,10 @@ app.get('/scanner', async (req, res) => {
           setTimeout(() => {
             resultDiv.innerHTML = '';
             startScanner();
-          }, 3500);
+          }, 4000);
           return;
         }
 
-        // Attendance check passed, open modal to ask about meal
         pendingWorkerId = workerId;
         document.getElementById('modalWorkerName').innerText = data.worker.full_name + ' (' + data.worker.worker_id + ')';
         document.getElementById('mealModal').style.display = 'flex';
@@ -1154,7 +1163,7 @@ app.get('/scanner', async (req, res) => {
   res.send(layout('Scanner Portal', content));
 });
 
-// API Endpoint Step 1: Validate Attendance Rules
+// API Endpoint Step 1: Validate Attendance Rules & Time Windows
 app.post('/api/attendance/check', async (req, res) => {
   const { worker_id, attendance_type } = req.body;
   const client = await pool.connect();
@@ -1167,6 +1176,11 @@ app.post('/api/attendance/check', async (req, res) => {
     
     const ph = getPHTime();
     const today = ph.date;
+    const currentTime = ph.time.substring(0, 5); // HH:MM format
+
+    // Get schedule time windows
+    const schedRes = await client.query('SELECT * FROM work_schedules LIMIT 1');
+    const sched = schedRes.rows[0];
 
     const todayLogsRes = await client.query(
       'SELECT * FROM attendance_logs WHERE worker_id = $1 AND attendance_date = $2 ORDER BY attendance_time ASC, id ASC',
@@ -1176,19 +1190,29 @@ app.post('/api/attendance/check', async (req, res) => {
 
     let expectedType = '';
     let stepDescription = '';
+    let timeStart = '';
+    let timeEnd = '';
 
     if (logsCount === 0) {
       expectedType = 'IN';
       stepDescription = '1st Scan: Umaga Time IN';
+      timeStart = sched.morning_in_start || '06:00';
+      timeEnd = sched.morning_in_end || '07:00';
     } else if (logsCount === 1) {
       expectedType = 'OUT';
       stepDescription = '2nd Scan: Umaga Time OUT (Lunch Break)';
+      timeStart = sched.morning_out_start || '11:30';
+      timeEnd = sched.morning_out_end || '12:00';
     } else if (logsCount === 2) {
       expectedType = 'IN';
       stepDescription = '3rd Scan: Hapon Time IN';
+      timeStart = sched.afternoon_in_start || '12:00';
+      timeEnd = sched.afternoon_in_end || '13:00';
     } else if (logsCount === 3) {
       expectedType = 'OUT';
       stepDescription = '4th Scan: Hapon Time OUT (Uwian)';
+      timeStart = sched.afternoon_out_start || '17:00';
+      timeEnd = sched.afternoon_out_end || '18:00';
     } else {
       return res.json({ success: false, message: 'Tapos na ang 4 na beses na pag-scan mo ngayong araw (Complete na ang Umaga at Hapon).' });
     }
@@ -1196,7 +1220,15 @@ app.post('/api/attendance/check', async (req, res) => {
     if (attendance_type !== expectedType) {
       return res.json({ 
         success: false, 
-        message: `Maling pindot! Ang sunod na kailangan mong i-scan ngayon ay ${expectedType} (${stepDescription}).` 
+        message: `Maling pindot! Ang sunod mong i-scan ay ${expectedType} (${stepDescription}).` 
+      });
+    }
+
+    // Time Window Validation Check
+    if (currentTime < timeStart || currentTime > timeEnd) {
+      return res.json({
+        success: false,
+        message: `Bawal pang mag-scan! Ang oras para sa ${stepDescription} ay sa pagitan ng ${timeStart} hanggang ${timeEnd}. (Current Time: ${ph.time})`
       });
     }
 
@@ -1222,7 +1254,6 @@ app.post('/api/attendance/commit', async (req, res) => {
     const today = ph.date;
     const timeStr = ph.time;
 
-    // Insert attendance log
     await client.query(
       'INSERT INTO attendance_logs (worker_id, attendance_date, attendance_time, attendance_type) VALUES ($1, $2, $3, $4)',
       [worker_id, today, timeStr, attendance_type]
@@ -1233,7 +1264,6 @@ app.post('/api/attendance/commit', async (req, res) => {
       const settingsRes = await client.query('SELECT default_meal_deduction FROM company_settings LIMIT 1');
       mealAmount = parseFloat(settingsRes.rows[0]?.default_meal_deduction || 50.00);
 
-      // Save meal deduction
       await client.query(
         'INSERT INTO deductions (worker_id, deduction_name, amount, deduction_date, notes) VALUES ($1, $2, $3, $4, $5)',
         [worker_id, 'Meal Deduction', mealAmount, today, `Automatic deduction from QR scan (${attendance_type})`]

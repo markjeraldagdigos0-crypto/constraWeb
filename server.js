@@ -27,14 +27,17 @@ const pool = new Pool({
 function getPHTime() {
   const now = new Date();
   const optionsDate = { timeZone: 'Asia/Manila', year: 'numeric', month: '2-digit', day: '2-digit' };
-  const optionsTime = { timeZone: 'Asia/Manila', hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' };
+  const optionsTime24 = { timeZone: 'Asia/Manila', hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' };
+  const optionsTime12 = { timeZone: 'Asia/Manila', hour12: true, hour: 'numeric', minute: '2-digit', second: '2-digit' };
   
-  const formatterDate = new Intl.DateTimeFormat('en-CA', optionsDate); // YYYY-MM-DD format
-  const formatterTime = new Intl.DateTimeFormat('en-GB', optionsTime); // HH:MM:SS format
+  const formatterDate = new Intl.DateTimeFormat('en-CA', optionsDate); // YYYY-MM-DD
+  const formatterTime24 = new Intl.DateTimeFormat('en-GB', optionsTime24); // HH:MM:SS (24-hour for comparison)
+  const formatterTime12 = new Intl.DateTimeFormat('en-US', optionsTime12); // h:MM:SS AM/PM
   
   return {
     date: formatterDate.format(now),
-    time: formatterTime.format(now),
+    time24: formatterTime24.format(now),
+    time: formatterTime12.format(now),
     timestamp: new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Manila' }))
   };
 }
@@ -92,7 +95,7 @@ async function initDB() {
         id SERIAL PRIMARY KEY,
         worker_id VARCHAR(50) NOT NULL,
         attendance_date DATE NOT NULL,
-        attendance_time TIME NOT NULL,
+        attendance_time VARCHAR(50) NOT NULL,
         attendance_type VARCHAR(10) NOT NULL,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
@@ -124,7 +127,7 @@ async function initDB() {
       );
     `);
 
-    // Auto-migrate missing columns for work_schedules and workers
+    // Auto-migrate missing columns
     await pool.query(`
       ALTER TABLE workers ADD COLUMN IF NOT EXISTS password TEXT NOT NULL DEFAULT '';
       ALTER TABLE work_schedules ADD COLUMN IF NOT EXISTS morning_in_start VARCHAR(10) DEFAULT '06:00';
@@ -164,6 +167,17 @@ function requireAdmin(req, res, next) {
     return next();
   }
   res.redirect('/admin/login');
+}
+
+// Helper to convert 24h to 12h format for display
+function formatTimeTo12Hour(time24) {
+  if (!time24) return '';
+  const [hourStr, minuteStr] = time24.split(':');
+  let hour = parseInt(hourStr, 10);
+  const ampm = hour >= 12 ? 'PM' : 'AM';
+  hour = hour % 12;
+  hour = hour ? hour : 12; // the hour '0' should be '12'
+  return `${hour}:${minuteStr} ${ampm}`;
 }
 
 function layout(title, content) {
@@ -547,7 +561,7 @@ app.get('/admin/attendance', requireAdmin, async (req, res) => {
     params.push(dateFilter);
     query += ` AND a.attendance_date = $${params.length}`;
   }
-  query += ' ORDER BY a.attendance_date DESC, a.attendance_time DESC LIMIT 100';
+  query += ' ORDER BY a.attendance_date DESC, a.created_at DESC LIMIT 100';
   const logs = await pool.query(query, params);
 
   let content = `
@@ -855,7 +869,7 @@ app.get('/admin/schedule', requireAdmin, async (req, res) => {
   }
   const sched = schedRes.rows[0];
   let content = `
-    <header><div class="brand"><h2>Work Schedule</h2></div></header>
+    <header><div class="brand"><h2>Work Schedule & Time Windows</h2></div></header>
     ${adminNav}
     <div class="card">
       <form action="/admin/schedule" method="POST">
@@ -955,7 +969,6 @@ app.get('/worker/logout', (req, res) => {
   });
 });
 
-// Worker Change Password Endpoint
 app.post('/worker/change-password', async (req, res) => {
   if (!req.session || !req.session.workerId) {
     return res.redirect('/worker/login');
@@ -1004,7 +1017,7 @@ app.get('/worker', async (req, res) => {
   const wRes = await pool.query('SELECT * FROM workers WHERE worker_id = $1', [worker_id]);
   if (wRes.rows.length > 0) {
     worker = wRes.rows[0];
-    const attRes = await pool.query('SELECT * FROM attendance_logs WHERE worker_id = $1 ORDER BY attendance_date DESC, attendance_time DESC LIMIT 20', [worker_id]);
+    const attRes = await pool.query('SELECT * FROM attendance_logs WHERE worker_id = $1 ORDER BY attendance_date DESC, created_at DESC LIMIT 20', [worker_id]);
     attendance = attRes.rows;
     const advRes = await pool.query('SELECT * FROM advance_money WHERE worker_id = $1 ORDER BY advance_date DESC', [worker_id]);
     advances = advRes.rows;
@@ -1232,7 +1245,7 @@ app.get('/scanner', async (req, res) => {
   res.send(layout('Scanner Portal', content));
 });
 
-// API Endpoint Step 1: Validate Attendance Rules (Time Windows removed)
+// API Endpoint Step 1: Validate Attendance Rules with Time Window Check
 app.post('/api/attendance/check', async (req, res) => {
   const { worker_id, attendance_type } = req.body;
   const client = await pool.connect();
@@ -1245,9 +1258,10 @@ app.post('/api/attendance/check', async (req, res) => {
     
     const ph = getPHTime();
     const today = ph.date;
+    const currentTime24 = ph.time24; // e.g. "06:30:00"
 
     const todayLogsRes = await client.query(
-      'SELECT * FROM attendance_logs WHERE worker_id = $1 AND attendance_date = $2 ORDER BY attendance_time ASC, id ASC',
+      'SELECT * FROM attendance_logs WHERE worker_id = $1 AND attendance_date = $2 ORDER BY created_at ASC, id ASC',
       [worker_id, today]
     );
     const logsCount = todayLogsRes.rows.length;
@@ -1278,15 +1292,53 @@ app.post('/api/attendance/check', async (req, res) => {
       });
     }
 
+    // TIME WINDOW VALIDATION
+    const schedRes = await client.query('SELECT * FROM work_schedules LIMIT 1');
+    if (schedRes.rows.length > 0) {
+      const s = schedRes.rows[0];
+      let windowStart = '';
+      let windowEnd = '';
+      let sessionName = '';
+
+      if (logsCount === 0) {
+        windowStart = s.morning_in_start;
+        windowEnd = s.morning_in_end;
+        sessionName = 'Umaga Time IN';
+      } else if (logsCount === 1) {
+        windowStart = s.morning_out_start;
+        windowEnd = s.morning_out_end;
+        sessionName = 'Umaga Time OUT';
+      } else if (logsCount === 2) {
+        windowStart = s.afternoon_in_start;
+        windowEnd = s.afternoon_in_end;
+        sessionName = 'Hapon Time IN';
+      } else if (logsCount === 3) {
+        windowStart = s.afternoon_out_start;
+        windowEnd = s.afternoon_out_end;
+        sessionName = 'Hapon Time OUT';
+      }
+
+      if (windowStart && windowEnd) {
+        const curTime = currentTime24.substring(0, 5); // HH:MM
+        if (curTime < windowStart || curTime > windowEnd) {
+          return res.json({
+            success: false,
+            message: `Hindi pa oras o lampas na para sa ${sessionName}!\nNakatakdang oras: ${formatTimeTo12Hour(windowStart)} hanggang ${formatTimeTo12Hour(windowEnd)}.`
+          });
+        }
+      }
+    }
+
     res.json({ success: true, worker, stepDescription });
   } catch (err) {
+    console.error('Error checking attendance:', err);
     res.json({ success: false, message: 'Server error during attendance validation.' });
   } finally {
     client.release();
   }
 });
 
-// API Endpoint Step 2: Commit Attendance
+// API Endpoint Step 2: Commit Attendance with 12-hour formatted time string
 app.post('/api/attendance/commit', async (req, res) => {
   const { worker_id, attendance_type, is_eating } = req.body;
   const client = await pool.connect();
@@ -1298,11 +1350,11 @@ app.post('/api/attendance/commit', async (req, res) => {
 
     const ph = getPHTime();
     const today = ph.date;
-    const timeStr = ph.time;
+    const timeStr12 = ph.time; // 12-hour format string e.g. "8:05:30 AM"
 
     await client.query(
       'INSERT INTO attendance_logs (worker_id, attendance_date, attendance_time, attendance_type) VALUES ($1, $2, $3, $4)',
-      [worker_id, today, timeStr, attendance_type]
+      [worker_id, today, timeStr12, attendance_type]
     );
 
     let mealAmount = 0;
@@ -1317,7 +1369,7 @@ app.post('/api/attendance/commit', async (req, res) => {
     }
 
     await client.query('COMMIT');
-    res.json({ success: true, worker, date: today, time: timeStr, mealAmount, stepDescription: `Recorded Time ${attendance_type}` });
+    res.json({ success: true, worker, date: today, time: timeStr12, mealAmount, stepDescription: `Recorded Time ${attendance_type}` });
   } catch (err) {
     await client.query('ROLLBACK');
     res.json({ success: false, message: 'Server error during attendance commit.' });

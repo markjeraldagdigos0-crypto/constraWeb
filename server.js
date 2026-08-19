@@ -39,7 +39,7 @@ function getPHTime() {
   };
 }
 
-// Initialize Database Tables & Default Settings
+// Initialize Database Tables & Auto-Migrate missing columns
 async function initDB() {
   try {
     await pool.query(`
@@ -77,7 +77,7 @@ async function initDB() {
       CREATE TABLE IF NOT EXISTS workers (
         id SERIAL PRIMARY KEY,
         worker_id VARCHAR(50) UNIQUE NOT NULL,
-        password TEXT NOT NULL,
+        password TEXT NOT NULL DEFAULT '',
         full_name VARCHAR(255) NOT NULL,
         position VARCHAR(100) NOT NULL,
         contact_number VARCHAR(50),
@@ -124,6 +124,11 @@ async function initDB() {
       );
     `);
 
+    // Automatic Migration: Siguruhing may password column ang workers table kung luma na ito
+    await pool.query(`
+      ALTER TABLE workers ADD COLUMN IF NOT EXISTS password TEXT NOT NULL DEFAULT '';
+    `);
+
     const settingsCheck = await pool.query('SELECT * FROM company_settings');
     if (settingsCheck.rows.length === 0) {
       await pool.query('INSERT INTO company_settings (company_name, default_meal_deduction) VALUES ($1, $2)', ['BuildCorp Construction', 50.00]);
@@ -134,7 +139,7 @@ async function initDB() {
       await pool.query(`INSERT INTO work_schedules (morning_in_start, morning_in_end, morning_out_start, morning_out_end, afternoon_in_start, afternoon_in_end, afternoon_out_start, afternoon_out_end) 
         VALUES ('06:00', '07:00', '11:30', '12:00', '12:00', '13:00', '17:00', '18:00')`);
     }
-    console.log('Database initialized successfully.');
+    console.log('Database initialized and migrated successfully.');
   } catch (err) {
     console.error('Database initialization error:', err);
   }

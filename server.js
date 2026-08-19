@@ -210,7 +210,6 @@ const adminNav = `
     <a href="/admin/announcements">Announcements</a>
     <a href="/admin/settings">Company Settings</a>
     <a href="/admin/schedule">Work Schedule</a>
-    <a href="/">Return to Main</a>
   </nav>
 `;
 
@@ -599,7 +598,7 @@ app.get('/admin/salary', async (req, res) => {
     const advRes = await pool.query('SELECT SUM(amount) as total_adv FROM advance_money WHERE worker_id = $1', [w.worker_id]);
     let totalAdvance = parseFloat(advRes.rows[0].total_adv) || 0;
     let netSalary = totalSalary - totalAdvance;
-    if (netSalary < 0) netSalary = 0; // Prevent negative payroll if advance exceeds earnings
+    if (netSalary < 0) netSalary = 0;
 
     grandTotalGross += totalSalary;
     grandTotalAdvance += totalAdvance;
@@ -666,7 +665,6 @@ app.get('/admin/salary/reset', async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    // Clear attendance logs and advance money to reset current cycle balances to 0
     await client.query('DELETE FROM attendance_logs');
     await client.query('DELETE FROM advance_money');
     await client.query('COMMIT');
@@ -804,7 +802,6 @@ app.get('/worker', async (req, res) => {
         ${settings.company_logo ? `<img src="${settings.company_logo}" alt="Logo">` : ''}
         <h2>${settings.company_name} - Worker Portal</h2>
       </div>
-      <a href="/" class="btn btn-warning">Return to Main</a>
     </header>
     <div class="card">
       <h3>Enter Your Worker ID to View Information</h3>
@@ -871,7 +868,6 @@ app.get('/scanner', async (req, res) => {
         ${settings.company_logo ? `<img src="${settings.company_logo}" alt="Logo">` : ''}
         <h2>${settings.company_name} - Scanner & Inventory Portal</h2>
       </div>
-      <a href="/" class="btn btn-warning">Return to Main</a>
     </header>
 
     <div class="card">

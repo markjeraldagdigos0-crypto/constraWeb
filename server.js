@@ -38,7 +38,8 @@ async function initDB() {
         company_name VARCHAR(255) DEFAULT 'BuildCorp Construction',
         company_logo TEXT DEFAULT '',
         company_address VARCHAR(255) DEFAULT '123 Builder St, Metro City',
-        contact_number VARCHAR(50) DEFAULT '555-0199'
+        contact_number VARCHAR(50) DEFAULT '555-0199',
+        default_meal_deduction NUMERIC(10,2) DEFAULT 50.00
       );
 
       CREATE TABLE IF NOT EXISTS work_schedules (
@@ -126,8 +127,14 @@ async function initDB() {
 
     const settingsCheck = await pool.query('SELECT * FROM company_settings');
     if (settingsCheck.rows.length === 0) {
-      await pool.query('INSERT INTO company_settings (company_name) VALUES ($1)', ['BuildCorp Construction']);
+      await pool.query('INSERT INTO company_settings (company_name, default_meal_deduction) VALUES ($1, $2)', ['BuildCorp Construction', 50.00]);
+    } else {
+      // Check if column exists, if not add it safely
+      try {
+        await pool.query('ALTER TABLE company_settings ADD COLUMN IF NOT EXISTS default_meal_deduction NUMERIC(10,2) DEFAULT 50.00');
+      } catch(e) {}
     }
+
     const scheduleCheck = await pool.query('SELECT * FROM work_schedules');
     if (scheduleCheck.rows.length === 0) {
       await pool.query('INSERT INTO work_schedules DEFAULT VALUES');
@@ -141,7 +148,7 @@ initDB();
 
 async function getSettings() {
   const res = await pool.query('SELECT * FROM company_settings LIMIT 1');
-  return res.rows[0] || { company_name: 'BuildCorp Construction', company_logo: '', company_address: '', contact_number: '' };
+  return res.rows[0] || { company_name: 'BuildCorp Construction', company_logo: '', company_address: '', contact_number: '', default_meal_deduction: 50.00 };
 }
 
 function layout(title, content, activeTab = '') {
@@ -816,6 +823,8 @@ app.get('/admin/settings', async (req, res) => {
         <input type="text" name="company_address" value="${settings.company_address || ''}">
         <label>Contact Number</label>
         <input type="text" name="contact_number" value="${settings.contact_number || ''}">
+        <label>Default Meal Deduction Amount (₱)</label>
+        <input type="number" step="0.01" name="default_meal_deduction" value="${settings.default_meal_deduction || 50.00}" required>
         <button type="submit" class="btn btn-success">Save Settings</button>
       </form>
     </div>
@@ -824,9 +833,9 @@ app.get('/admin/settings', async (req, res) => {
 });
 
 app.post('/admin/settings', async (req, res) => {
-  const { company_name, company_logo, company_address, contact_number } = req.body;
-  await pool.query('UPDATE company_settings SET company_name = $1, company_logo = $2, company_address = $3, contact_number = $4 WHERE id = 1',
-    [company_name, company_logo, company_address, contact_number]);
+  const { company_name, company_logo, company_address, contact_number, default_meal_deduction } = req.body;
+  await pool.query('UPDATE company_settings SET company_name = $1, company_logo = $2, company_address = $3, contact_number = $4, default_meal_deduction = $5 WHERE id = 1',
+    [company_name, company_logo, company_address, contact_number, default_meal_deduction]);
   res.redirect('/admin/settings');
 });
 
@@ -994,6 +1003,19 @@ app.get('/scanner', async (req, res) => {
       <div id="scanResult" style="margin-top: 15px; text-align: center; font-weight: bold; font-size: 16px;"></div>
     </div>
 
+    <!-- MEAL PROMPT MODAL OVERLAY -->
+    <div id="mealModal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.6); z-index:9999; justify-content:center; align-items:center;">
+      <div style="background:white; padding:30px; border-radius:10px; text-align:center; max-width:400px; width:90%; box-shadow: 0 4px 6px rgba(0,0,0,0.2);">
+        <h3 style="color:var(--primary); margin-bottom:10px;">MEAL DEDUCTION QUERY</h3>
+        <p id="modalWorkerName" style="font-size:16px; font-weight:bold; color:var(--accent); margin-bottom:15px;"></p>
+        <p style="margin-bottom:20px;">Kakain ba ang worker na ito ngayon? (May bawas na ₱${settings.default_meal_deduction || 50.00} pag OO)</p>
+        <div style="display:flex; gap:15px; justify-content:center;">
+          <button onclick="resolveMeal(true)" class="btn btn-success" style="flex:1; padding:12px;">OO (Kain)</button>
+          <button onclick="resolveMeal(false)" class="btn btn-danger" style="flex:1; padding:12px;">HINDI</button>
+        </div>
+      </div>
+    </div>
+
     <div class="card">
       <h3>Stock IN / OUT Management</h3>
       <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
@@ -1038,6 +1060,7 @@ app.get('/scanner', async (req, res) => {
     <script>
       let currentMode = '';
       let html5QrCode = null;
+      let pendingWorkerId = null;
 
       function setMode(mode) {
         currentMode = mode;
@@ -1061,7 +1084,7 @@ app.get('/scanner', async (req, res) => {
           { fps: 10, qrbox: { width: 250, height: 250 } },
           async (decodedText) => {
             await stopScanner();
-            processAttendance(decodedText);
+            checkAttendanceAndPromptMeal(decodedText);
           },
           (errorMessage) => {}
         ).catch(err => {
@@ -1077,19 +1100,50 @@ app.get('/scanner', async (req, res) => {
         document.getElementById('stopBtn').style.display = 'none';
       }
 
-      async function processAttendance(workerId) {
-        const res = await fetch('/api/attendance', {
+      async function checkAttendanceAndPromptMeal(workerId) {
+        // Step 1: Validate attendance first via backend API
+        const res = await fetch('/api/attendance/check', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ worker_id: workerId, attendance_type: currentMode })
         });
         const data = await res.json();
         const resultDiv = document.getElementById('scanResult');
+
+        if (!data.success) {
+          resultDiv.innerHTML = \`<div class="alert-box alert-danger">ERROR: \${data.message}</div>\`;
+          setTimeout(() => {
+            resultDiv.innerHTML = '';
+            startScanner();
+          }, 3500);
+          return;
+        }
+
+        // Attendance check passed, open modal to ask about meal
+        pendingWorkerId = workerId;
+        document.getElementById('modalWorkerName').innerText = data.worker.full_name + ' (' + data.worker.worker_id + ')';
+        document.getElementById('mealModal').style.display = 'flex';
+      }
+
+      async function resolveMeal(isEating) {
+        document.getElementById('mealModal').style.display = 'none';
+
+        const res = await fetch('/api/attendance/commit', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ worker_id: pendingWorkerId, attendance_type: currentMode, is_eating: isEating })
+        });
+        const data = await res.json();
+        const resultDiv = document.getElementById('scanResult');
+
         if (data.success) {
-          resultDiv.innerHTML = \`<div class="alert-box alert-success">SUCCESS! (\${data.stepDescription})<br>\${data.worker.full_name}<br>ID: \${data.worker.worker_id}<br>TIME \${currentMode}<br>\${data.date} \${data.time}</div>\`;
+          let mealMsg = isEating ? '<br><span style="color:var(--danger)">May nabawas na Meal Deduction (₱' + data.mealAmount + ')</span>' : '<br><span style="color:var(--success)">Walang meal deduction.</span>';
+          resultDiv.innerHTML = \`<div class="alert-box alert-success">SUCCESS! (\${data.stepDescription})<br>\${data.worker.full_name}<br>ID: \${data.worker.worker_id}<br>TIME \${currentMode}<br>\${data.date} \${data.time}\${mealMsg}</div>\`;
         } else {
           resultDiv.innerHTML = \`<div class="alert-box alert-danger">ERROR: \${data.message}</div>\`;
         }
+
+        pendingWorkerId = null;
         setTimeout(() => {
           resultDiv.innerHTML = '';
           startScanner();
@@ -1100,8 +1154,8 @@ app.get('/scanner', async (req, res) => {
   res.send(layout('Scanner Portal', content));
 });
 
-// API Endpoint for Strict 4-Scans Sequence (1: Umaga IN, 2: Umaga OUT, 3: Hapon IN, 4: Hapon OUT)
-app.post('/api/attendance', async (req, res) => {
+// API Endpoint Step 1: Validate Attendance Rules
+app.post('/api/attendance/check', async (req, res) => {
   const { worker_id, attendance_type } = req.body;
   const client = await pool.connect();
   try {
@@ -1113,7 +1167,6 @@ app.post('/api/attendance', async (req, res) => {
     
     const ph = getPHTime();
     const today = ph.date;
-    const timeStr = ph.time;
 
     const todayLogsRes = await client.query(
       'SELECT * FROM attendance_logs WHERE worker_id = $1 AND attendance_date = $2 ORDER BY attendance_time ASC, id ASC',
@@ -1147,14 +1200,51 @@ app.post('/api/attendance', async (req, res) => {
       });
     }
 
+    res.json({ success: true, worker, stepDescription });
+  } catch (err) {
+    res.json({ success: false, message: 'Server error during attendance validation.' });
+  } finally {
+    client.release();
+  }
+});
+
+// API Endpoint Step 2: Commit Attendance and Handle Meal Deduction Choice
+app.post('/api/attendance/commit', async (req, res) => {
+  const { worker_id, attendance_type, is_eating } = req.body;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    
+    const workerRes = await client.query('SELECT * FROM workers WHERE worker_id = $1', [worker_id]);
+    const worker = workerRes.rows[0];
+
+    const ph = getPHTime();
+    const today = ph.date;
+    const timeStr = ph.time;
+
+    // Insert attendance log
     await client.query(
       'INSERT INTO attendance_logs (worker_id, attendance_date, attendance_time, attendance_type) VALUES ($1, $2, $3, $4)',
       [worker_id, today, timeStr, attendance_type]
     );
 
-    res.json({ success: true, worker, date: today, time: timeStr, stepDescription });
+    let mealAmount = 0;
+    if (is_eating) {
+      const settingsRes = await client.query('SELECT default_meal_deduction FROM company_settings LIMIT 1');
+      mealAmount = parseFloat(settingsRes.rows[0]?.default_meal_deduction || 50.00);
+
+      // Save meal deduction
+      await client.query(
+        'INSERT INTO deductions (worker_id, deduction_name, amount, deduction_date, notes) VALUES ($1, $2, $3, $4, $5)',
+        [worker_id, 'Meal Deduction', mealAmount, today, `Automatic deduction from QR scan (${attendance_type})`]
+      );
+    }
+
+    await client.query('COMMIT');
+    res.json({ success: true, worker, date: today, time: timeStr, mealAmount, stepDescription: `Recorded Time ${attendance_type}` });
   } catch (err) {
-    res.json({ success: false, message: 'Server error during attendance recording.' });
+    await client.query('ROLLBACK');
+    res.json({ success: false, message: 'Server error during attendance commit.' });
   } finally {
     client.release();
   }

@@ -124,8 +124,17 @@ async function initDB() {
       );
     `);
 
+    // Auto-migrate missing columns for work_schedules and workers
     await pool.query(`
       ALTER TABLE workers ADD COLUMN IF NOT EXISTS password TEXT NOT NULL DEFAULT '';
+      ALTER TABLE work_schedules ADD COLUMN IF NOT EXISTS morning_in_start VARCHAR(10) DEFAULT '06:00';
+      ALTER TABLE work_schedules ADD COLUMN IF NOT EXISTS morning_in_end VARCHAR(10) DEFAULT '07:00';
+      ALTER TABLE work_schedules ADD COLUMN IF NOT EXISTS morning_out_start VARCHAR(10) DEFAULT '11:30';
+      ALTER TABLE work_schedules ADD COLUMN IF NOT EXISTS morning_out_end VARCHAR(10) DEFAULT '12:00';
+      ALTER TABLE work_schedules ADD COLUMN IF NOT EXISTS afternoon_in_start VARCHAR(10) DEFAULT '12:00';
+      ALTER TABLE work_schedules ADD COLUMN IF NOT EXISTS afternoon_in_end VARCHAR(10) DEFAULT '13:00';
+      ALTER TABLE work_schedules ADD COLUMN IF NOT EXISTS afternoon_out_start VARCHAR(10) DEFAULT '17:00';
+      ALTER TABLE work_schedules ADD COLUMN IF NOT EXISTS afternoon_out_end VARCHAR(10) DEFAULT '18:00';
     `);
 
     const settingsCheck = await pool.query('SELECT * FROM company_settings');
@@ -838,7 +847,12 @@ app.post('/admin/settings', requireAdmin, async (req, res) => {
 });
 
 app.get('/admin/schedule', requireAdmin, async (req, res) => {
-  const schedRes = await pool.query('SELECT * FROM work_schedules LIMIT 1');
+  let schedRes = await pool.query('SELECT * FROM work_schedules LIMIT 1');
+  if (schedRes.rows.length === 0) {
+    await pool.query(`INSERT INTO work_schedules (morning_in_start, morning_in_end, morning_out_start, morning_out_end, afternoon_in_start, afternoon_in_end, afternoon_out_start, afternoon_out_end) 
+      VALUES ('06:00', '07:00', '11:30', '12:00', '12:00', '13:00', '17:00', '18:00')`);
+    schedRes = await pool.query('SELECT * FROM work_schedules LIMIT 1');
+  }
   const sched = schedRes.rows[0];
   let content = `
     <header><div class="brand"><h2>Work Schedule</h2></div></header>
@@ -874,9 +888,21 @@ app.get('/admin/schedule', requireAdmin, async (req, res) => {
 
 app.post('/admin/schedule', requireAdmin, async (req, res) => {
   const { morning_in_start, morning_in_end, morning_out_start, morning_out_end, afternoon_in_start, afternoon_in_end, afternoon_out_start, afternoon_out_end } = req.body;
-  await pool.query(`UPDATE work_schedules SET morning_in_start = $1, morning_in_end = $2, morning_out_start = $3, morning_out_end = $4, afternoon_in_start = $5, afternoon_in_end = $6, afternoon_out_start = $7, afternoon_out_end = $8 WHERE id = 1`,
-    [morning_in_start, morning_in_end, morning_out_start, morning_out_end, afternoon_in_start, afternoon_in_end, afternoon_out_start, afternoon_out_end]);
-  res.redirect('/admin/schedule');
+  try {
+    const check = await pool.query('SELECT * FROM work_schedules LIMIT 1');
+    if (check.rows.length === 0) {
+      await pool.query(`INSERT INTO work_schedules (morning_in_start, morning_in_end, morning_out_start, morning_out_end, afternoon_in_start, afternoon_in_end, afternoon_out_start, afternoon_out_end) 
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        [morning_in_start, morning_in_end, morning_out_start, morning_out_end, afternoon_in_start, afternoon_in_end, afternoon_out_start, afternoon_out_end]);
+    } else {
+      await pool.query(`UPDATE work_schedules SET morning_in_start = $1, morning_in_end = $2, morning_out_start = $3, morning_out_end = $4, afternoon_in_start = $5, afternoon_in_end = $6, afternoon_out_start = $7, afternoon_out_end = $8 WHERE id = $9`,
+        [morning_in_start, morning_in_end, morning_out_start, morning_out_end, afternoon_in_start, afternoon_in_end, afternoon_out_start, afternoon_out_end, check.rows[0].id]);
+    }
+    res.redirect('/admin/schedule');
+  } catch (err) {
+    console.error('Error saving schedule:', err);
+    res.status(500).send('Database Error saving schedule: ' + err.message);
+  }
 });
 
 

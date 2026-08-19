@@ -13,6 +13,22 @@ const pool = new Pool({
   ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false
 });
 
+// Helper function to get current Philippine Time (PST)
+function getPHTime() {
+  const now = new Date();
+  const optionsDate = { timeZone: 'Asia/Manila', year: 'numeric', month: '2-digit', day: '2-digit' };
+  const optionsTime = { timeZone: 'Asia/Manila', hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' };
+  
+  const formatterDate = new Intl.DateTimeFormat('en-CA', optionsDate); // YYYY-MM-DD format
+  const formatterTime = new Intl.DateTimeFormat('en-GB', optionsTime); // HH:MM:SS format
+  
+  return {
+    date: formatterDate.format(now),
+    time: formatterTime.format(now),
+    timestamp: new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Manila' }))
+  };
+}
+
 // Initialize Database Tables & Default Settings
 async function initDB() {
   try {
@@ -98,7 +114,6 @@ async function initDB() {
       );
     `);
 
-    // Insert defaults if empty
     const settingsCheck = await pool.query('SELECT * FROM company_settings');
     if (settingsCheck.rows.length === 0) {
       await pool.query('INSERT INTO company_settings (company_name) VALUES ($1)', ['BuildCorp Construction']);
@@ -114,13 +129,11 @@ async function initDB() {
 }
 initDB();
 
-// Helper to fetch company settings
 async function getSettings() {
   const res = await pool.query('SELECT * FROM company_settings LIMIT 1');
   return res.rows[0] || { company_name: 'BuildCorp Construction', company_logo: '', company_address: '', contact_number: '' };
 }
 
-// Common HTML Layout wrapper
 function layout(title, content, activeTab = '') {
   return `
     <!DOCTYPE html>
@@ -216,7 +229,8 @@ const adminNav = `
 app.get('/admin', async (req, res) => {
   const settings = await getSettings();
   const workersCount = await pool.query('SELECT COUNT(*) FROM workers');
-  const today = new Date().toISOString().split('T')[0];
+  const phNow = getPHTime();
+  const today = phNow.date;
   const presentToday = await pool.query('SELECT COUNT(DISTINCT worker_id) FROM attendance_logs WHERE attendance_date = $1', [today]);
   const materialsCount = await pool.query('SELECT COUNT(*) FROM materials');
   const lowStock = await pool.query('SELECT * FROM materials WHERE current_quantity <= minimum_stock_level');
@@ -518,6 +532,7 @@ app.post('/admin/stock/add', async (req, res) => {
 app.get('/admin/advance', async (req, res) => {
   const workers = await pool.query('SELECT * FROM workers WHERE status = \'Active\'');
   const advances = await pool.query('SELECT am.*, w.full_name FROM advance_money am JOIN workers w ON am.worker_id = w.worker_id ORDER BY am.advance_date DESC');
+  const phNow = getPHTime();
 
   let content = `
     <header><div class="brand"><h2>Advance Money Management</h2></div></header>
@@ -532,7 +547,7 @@ app.get('/admin/advance', async (req, res) => {
         <label>Amount (₱)</label>
         <input type="number" step="0.01" name="amount" required>
         <label>Date</label>
-        <input type="date" name="advance_date" value="${new Date().toISOString().split('T')[0]}" required>
+        <input type="date" name="advance_date" value="${phNow.date}" required>
         <label>Notes</label>
         <textarea name="notes"></textarea>
         <button type="submit" class="btn btn-success">Save Advance</button>
@@ -660,7 +675,6 @@ app.get('/admin/salary', async (req, res) => {
   res.send(layout('Salary Calculation', content));
 });
 
-// Route to Reset Attendance and Advance Money after Payout
 app.get('/admin/salary/reset', async (req, res) => {
   const client = await pool.connect();
   try {
@@ -731,7 +745,7 @@ app.get('/admin/settings', async (req, res) => {
 
 app.post('/admin/settings', async (req, res) => {
   const { company_name, company_logo, company_address, contact_number } = req.body;
-  await pool.query('UPDATE company_settings SET company_name = $1, company_logo = $2, company_address = $3, contact_number = $4 WHERE id = 1',
+  await pool.query('UPDATE company_settings SET company_name = $1, company_logo = $2, company_address = $3, company_address = $3, contact_number = $4 WHERE id = 1',
     [company_name, company_logo, company_address, contact_number]);
   res.redirect('/admin/settings');
 });
@@ -991,7 +1005,7 @@ app.get('/scanner', async (req, res) => {
   res.send(layout('Scanner Portal', content));
 });
 
-// API Endpoint for QR Attendance Processing with Sequence Validation
+// API Endpoint for QR Attendance Processing using Philippine Time (PST)
 app.post('/api/attendance', async (req, res) => {
   const { worker_id, attendance_type } = req.body;
   const client = await pool.connect();
@@ -1001,7 +1015,11 @@ app.post('/api/attendance', async (req, res) => {
       return res.json({ success: false, message: 'Worker not found or inactive.' });
     }
     const worker = workerRes.rows[0];
-    const today = new Date().toISOString().split('T')[0];
+    
+    // Get Philippine Time components
+    const ph = getPHTime();
+    const today = ph.date;
+    const timeStr = ph.time;
 
     const lastAttRes = await client.query(
       'SELECT * FROM attendance_logs WHERE worker_id = $1 AND attendance_date = $2 ORDER BY attendance_time DESC LIMIT 1',
@@ -1022,9 +1040,6 @@ app.post('/api/attendance', async (req, res) => {
         return res.json({ success: false, message: 'Cannot record two consecutive TIME OUT records.' });
       }
     }
-
-    const now = new Date();
-    const timeStr = now.toTimeString().split(' ')[0];
 
     await client.query(
       'INSERT INTO attendance_logs (worker_id, attendance_date, attendance_time, attendance_type) VALUES ($1, $2, $3, $4)',

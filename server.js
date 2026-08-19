@@ -138,6 +138,7 @@ async function initDB() {
       ALTER TABLE work_schedules ADD COLUMN IF NOT EXISTS afternoon_in_end VARCHAR(10) DEFAULT '13:00';
       ALTER TABLE work_schedules ADD COLUMN IF NOT EXISTS afternoon_out_start VARCHAR(10) DEFAULT '17:00';
       ALTER TABLE work_schedules ADD COLUMN IF NOT EXISTS afternoon_out_end VARCHAR(10) DEFAULT '18:00';
+      ALTER TABLE company_settings ADD COLUMN IF NOT EXISTS default_meal_deduction NUMERIC(10,2) DEFAULT 50.00;
     `);
 
     const settingsCheck = await pool.query('SELECT * FROM company_settings');
@@ -172,12 +173,15 @@ function requireAdmin(req, res, next) {
 // Helper to convert 24h to 12h format for display
 function formatTimeTo12Hour(time24) {
   if (!time24) return '';
-  const [hourStr, minuteStr] = time24.split(':');
-  let hour = parseInt(hourStr, 10);
+  // Kung sakaling naka-format nang "HH:MM:SS" o "HH:MM"
+  const parts = time24.split(':');
+  if (parts.length < 2) return time24;
+  let hour = parseInt(parts[0], 10);
+  const minute = parts[1];
   const ampm = hour >= 12 ? 'PM' : 'AM';
   hour = hour % 12;
-  hour = hour ? hour : 12; // the hour '0' should be '12'
-  return `${hour}:${minuteStr} ${ampm}`;
+  hour = hour ? hour : 12; // 0 becomes 12
+  return `${hour}:${minute} ${ampm}`;
 }
 
 function layout(title, content) {
@@ -855,9 +859,16 @@ app.get('/admin/settings', requireAdmin, async (req, res) => {
 
 app.post('/admin/settings', requireAdmin, async (req, res) => {
   const { company_name, company_logo, company_address, contact_number, default_meal_deduction } = req.body;
-  await pool.query('UPDATE company_settings SET company_name = $1, company_logo = $2, company_address = $3, company_number = $4, default_meal_deduction = $5 WHERE id = 1',
-    [company_name, company_logo, company_address, contact_number, default_meal_deduction]);
-  res.redirect('/admin/settings');
+  try {
+    await pool.query(
+      'UPDATE company_settings SET company_name = $1, company_logo = $2, company_address = $3, contact_number = $4, default_meal_deduction = $5 WHERE id = 1',
+      [company_name, company_logo, company_address, contact_number, default_meal_deduction]
+    );
+    res.redirect('/admin/settings');
+  } catch (err) {
+    console.error('Error saving settings:', err);
+    res.status(500).send('Database Error saving settings: ' + err.message);
+  }
 });
 
 app.get('/admin/schedule', requireAdmin, async (req, res) => {

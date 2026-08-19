@@ -1,11 +1,21 @@
 const express = require('express');
 const { Pool } = require('pg');
+const session = require('express-session');
+const bcrypt = require('bcryptjs');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
+
+// Session Configuration
+app.use(session({
+  secret: 'buildcorp_secret_key_2026',
+  resave: false,
+  saveUninitialized: false,
+  cookie: { maxAge: 24 * 60 * 60 * 1000 } // 1 day
+}));
 
 // PostgreSQL Connection
 const pool = new Pool({
@@ -33,6 +43,14 @@ function getPHTime() {
 async function initDB() {
   try {
     await pool.query(`
+      CREATE TABLE IF NOT EXISTS admin_users (
+        id SERIAL PRIMARY KEY,
+        username VARCHAR(100) UNIQUE NOT NULL,
+        password TEXT NOT NULL,
+        full_name VARCHAR(255),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+
       CREATE TABLE IF NOT EXISTS company_settings (
         id SERIAL PRIMARY KEY,
         company_name VARCHAR(255) DEFAULT 'BuildCorp Construction',
@@ -51,7 +69,7 @@ async function initDB() {
         afternoon_in_start VARCHAR(10) DEFAULT '12:00',
         afternoon_in_end VARCHAR(10) DEFAULT '13:00',
         afternoon_out_start VARCHAR(10) DEFAULT '17:00',
-        afternoon_out_end VARCHAR(18:00',
+        afternoon_out_end VARCHAR(10) DEFAULT '18:00',
         full_day_hours NUMERIC DEFAULT 9,
         half_day_hours NUMERIC DEFAULT 4.5
       );
@@ -132,27 +150,12 @@ async function initDB() {
     const settingsCheck = await pool.query('SELECT * FROM company_settings');
     if (settingsCheck.rows.length === 0) {
       await pool.query('INSERT INTO company_settings (company_name, default_meal_deduction) VALUES ($1, $2)', ['BuildCorp Construction', 50.00]);
-    } else {
-      try {
-        await pool.query('ALTER TABLE company_settings ADD COLUMN IF NOT EXISTS default_meal_deduction NUMERIC(10,2) DEFAULT 50.00');
-      } catch(e) {}
     }
 
     const scheduleCheck = await pool.query('SELECT * FROM work_schedules');
     if (scheduleCheck.rows.length === 0) {
       await pool.query(`INSERT INTO work_schedules (morning_in_start, morning_in_end, morning_out_start, morning_out_end, afternoon_in_start, afternoon_in_end, afternoon_out_start, afternoon_out_end) 
         VALUES ('06:00', '07:00', '11:30', '12:00', '12:00', '13:00', '17:00', '18:00')`);
-    } else {
-      try {
-        await pool.query('ALTER TABLE work_schedules ADD COLUMN IF NOT EXISTS morning_in_start VARCHAR(10) DEFAULT \'06:00\'');
-        await pool.query('ALTER TABLE work_schedules ADD COLUMN IF NOT EXISTS morning_in_end VARCHAR(10) DEFAULT \'07:00\'');
-        await pool.query('ALTER TABLE work_schedules ADD COLUMN IF NOT EXISTS morning_out_start VARCHAR(10) DEFAULT \'11:30\'');
-        await pool.query('ALTER TABLE work_schedules ADD COLUMN IF NOT EXISTS morning_out_end VARCHAR(10) DEFAULT \'12:00\'');
-        await pool.query('ALTER TABLE work_schedules ADD COLUMN IF NOT EXISTS afternoon_in_start VARCHAR(10) DEFAULT \'12:00\'');
-        await pool.query('ALTER TABLE work_schedules ADD COLUMN IF NOT EXISTS afternoon_in_end VARCHAR(10) DEFAULT \'13:00\'');
-        await pool.query('ALTER TABLE work_schedules ADD COLUMN IF NOT EXISTS afternoon_out_start VARCHAR(10) DEFAULT \'17:00\'');
-        await pool.query('ALTER TABLE work_schedules ADD COLUMN IF NOT EXISTS afternoon_out_end VARCHAR(10) DEFAULT \'18:00\'');
-      } catch(e) {}
     }
     console.log('Database initialized successfully.');
   } catch (err) {
@@ -166,7 +169,15 @@ async function getSettings() {
   return res.rows[0] || { company_name: 'BuildCorp Construction', company_logo: '', company_address: '', contact_number: '', default_meal_deduction: 50.00 };
 }
 
-function layout(title, content, activeTab = '') {
+// Middleware to protect Admin Routes
+function requireAdmin(req, res, next) {
+  if (req.session && req.session.adminId) {
+    return next();
+  }
+  res.redirect('/admin/login');
+}
+
+function layout(title, content) {
   return `
     <!DOCTYPE html>
     <html lang="en">
@@ -232,7 +243,7 @@ app.get('/', async (req, res) => {
       <p style="color: #64748b; margin-bottom: 30px;">Construction Worker & Inventory Management System</p>
       
       <div style="display: flex; justify-content: center; gap: 20px; flex-wrap: wrap;">
-        <a href="/admin" class="btn" style="padding: 20px 40px; font-size: 18px;">ADMIN PORTAL</a>
+        <a href="/admin/login" class="btn" style="padding: 20px 40px; font-size: 18px;">ADMIN PORTAL</a>
         <a href="/worker" class="btn btn-success" style="padding: 20px 40px; font-size: 18px;">WORKER PORTAL</a>
         <a href="/scanner" class="btn btn-warning" style="padding: 20px 40px; font-size: 18px;">SCANNER PORTAL</a>
       </div>
@@ -242,7 +253,103 @@ app.get('/', async (req, res) => {
 });
 
 // ==========================================
-// ADMIN PORTAL /admin
+// ADMIN AUTHENTICATION ROUTES
+// ==========================================
+app.get('/admin/login', async (req, res) => {
+  const settings = await getSettings();
+  const error = req.query.error || '';
+  const success = req.query.success || '';
+
+  let content = `
+    <div style="max-width: 400px; margin: 50px auto;" class="card">
+      <h2 style="text-align: center; margin-bottom: 20px;">Admin Login</h2>
+      ${error ? `<div class="alert-box alert-danger">${error}</div>` : ''}
+      ${success ? `<div class="alert-box alert-success">${success}</div>` : ''}
+      <form action="/admin/login" method="POST">
+        <label>Username</label>
+        <input type="text" name="username" required>
+        <label>Password</label>
+        <input type="password" name="password" required>
+        <button type="submit" class="btn" style="width: 100%; padding: 12px; margin-bottom: 15px;">Login</button>
+      </form>
+      <div style="text-align: center; font-size: 14px;">
+        Wala pang account? <a href="/admin/register" style="color: var(--accent); font-weight: bold;">Mag-register dito</a>
+      </div>
+    </div>
+  `;
+  res.send(layout(settings.company_name + ' - Admin Login', content));
+});
+
+app.post('/admin/login', async (req, res) => {
+  const { username, password } = req.body;
+  try {
+    const result = await pool.query('SELECT * FROM admin_users WHERE username = $1', [username]);
+    if (result.rows.length === 0) {
+      return res.redirect('/admin/login?error=Invalid username or password.');
+    }
+    const admin = result.rows[0];
+    const match = await bcrypt.compare(password, admin.password);
+    if (!match) {
+      return res.redirect('/admin/login?error=Invalid username or password.');
+    }
+
+    req.session.adminId = admin.id;
+    req.session.adminUsername = admin.username;
+    res.redirect('/admin');
+  } catch (err) {
+    res.redirect('/admin/login?error=Server error during login.');
+  }
+});
+
+app.get('/admin/register', async (req, res) => {
+  const settings = await getSettings();
+  const error = req.query.error || '';
+
+  let content = `
+    <div style="max-width: 400px; margin: 50px auto;" class="card">
+      <h2 style="text-align: center; margin-bottom: 20px;">Create Admin Account</h2>
+      ${error ? `<div class="alert-box alert-danger">${error}</div>` : ''}
+      <form action="/admin/register" method="POST">
+        <label>Full Name</label>
+        <input type="text" name="full_name" required>
+        <label>Username</label>
+        <input type="text" name="username" required>
+        <label>Password</label>
+        <input type="password" name="password" required>
+        <button type="submit" class="btn btn-success" style="width: 100%; padding: 12px; margin-bottom: 15px;">Register Account</button>
+      </form>
+      <div style="text-align: center; font-size: 14px;">
+        May account na? <a href="/admin/login" style="color: var(--accent); font-weight: bold;">Mag-login dito</a>
+      </div>
+    </div>
+  `;
+  res.send(layout(settings.company_name + ' - Admin Register', content));
+});
+
+app.post('/admin/register', async (req, res) => {
+  const { full_name, username, password } = req.body;
+  try {
+    const existing = await pool.query('SELECT * FROM admin_users WHERE username = $1', [username]);
+    if (existing.rows.length > 0) {
+      return res.redirect('/admin/register?error=Username is already taken.');
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+    await pool.query('INSERT INTO admin_users (username, password, full_name) VALUES ($1, $2, $3)', [username, hashedPassword, full_name]);
+    res.redirect('/admin/login?success=Account created successfully! Please login.');
+  } catch (err) {
+    res.redirect('/admin/register?error=Server error during registration.');
+  }
+});
+
+app.get('/admin/logout', (req, res) => {
+  req.session.destroy(() => {
+    res.redirect('/admin/login');
+  });
+});
+
+// ==========================================
+// ADMIN PORTAL /admin (Protected by requireAdmin)
 // ==========================================
 const adminNav = `
   <nav class="no-print">
@@ -256,10 +363,11 @@ const adminNav = `
     <a href="/admin/announcements">Announcements</a>
     <a href="/admin/settings">Company Settings</a>
     <a href="/admin/schedule">Work Schedule & Time Windows</a>
+    <a href="/admin/logout" style="background: var(--danger); color: white; margin-left: auto;">Logout</a>
   </nav>
 `;
 
-app.get('/admin', async (req, res) => {
+app.get('/admin', requireAdmin, async (req, res) => {
   const settings = await getSettings();
   const workersCount = await pool.query('SELECT COUNT(*) FROM workers');
   const phNow = getPHTime();
@@ -275,6 +383,7 @@ app.get('/admin', async (req, res) => {
         ${settings.company_logo ? `<img src="${settings.company_logo}" alt="Logo">` : ''}
         <h2>${settings.company_name} - Admin Portal</h2>
       </div>
+      <div>Logged in as: <strong>${req.session.adminUsername}</strong></div>
     </header>
     ${adminNav}
     <div class="grid-2">
@@ -309,7 +418,7 @@ app.get('/admin', async (req, res) => {
 });
 
 // Worker Management
-app.get('/admin/workers', async (req, res) => {
+app.get('/admin/workers', requireAdmin, async (req, res) => {
   const search = req.query.search || '';
   const workers = await pool.query('SELECT * FROM workers WHERE full_name ILIKE $1 OR worker_id ILIKE $1 ORDER BY id DESC', [`%${search}%`]);
 
@@ -345,7 +454,7 @@ app.get('/admin/workers', async (req, res) => {
   res.send(layout('Workers Management', content));
 });
 
-app.get('/admin/workers/register', async (req, res) => {
+app.get('/admin/workers/register', requireAdmin, async (req, res) => {
   const countRes = await pool.query('SELECT COUNT(*) FROM workers');
   const nextIdNum = parseInt(countRes.rows[0].count) + 1;
   const autoWorkerId = 'W-' + String(nextIdNum).padStart(4, '0');
@@ -374,14 +483,14 @@ app.get('/admin/workers/register', async (req, res) => {
   res.send(layout('Register Worker', content));
 });
 
-app.post('/admin/workers/register', async (req, res) => {
+app.post('/admin/workers/register', requireAdmin, async (req, res) => {
   const { worker_id, full_name, position, contact_number, daily_rate, assigned_project } = req.body;
   await pool.query('INSERT INTO workers (worker_id, full_name, position, contact_number, daily_rate, assigned_project) VALUES ($1, $2, $3, $4, $5, $6)',
     [worker_id, full_name, position, contact_number, daily_rate, assigned_project]);
   res.redirect(`/admin/workers/qr/${worker_id}`);
 });
 
-app.get('/admin/workers/qr/:worker_id', async (req, res) => {
+app.get('/admin/workers/qr/:worker_id', requireAdmin, async (req, res) => {
   const { worker_id } = req.params;
   const workerRes = await pool.query('SELECT * FROM workers WHERE worker_id = $1', [worker_id]);
   const settings = await getSettings();
@@ -414,7 +523,7 @@ app.get('/admin/workers/qr/:worker_id', async (req, res) => {
   res.send(layout('Worker QR', content));
 });
 
-app.get('/admin/workers/toggle/:worker_id', async (req, res) => {
+app.get('/admin/workers/toggle/:worker_id', requireAdmin, async (req, res) => {
   const { worker_id } = req.params;
   const workerRes = await pool.query('SELECT status FROM workers WHERE worker_id = $1', [worker_id]);
   if (workerRes.rows.length > 0) {
@@ -425,7 +534,7 @@ app.get('/admin/workers/toggle/:worker_id', async (req, res) => {
 });
 
 // Admin Attendance Report & Clear Logs
-app.get('/admin/attendance', async (req, res) => {
+app.get('/admin/attendance', requireAdmin, async (req, res) => {
   const search = req.query.search || '';
   const dateFilter = req.query.date || '';
   let query = 'SELECT a.*, w.full_name FROM attendance_logs a JOIN workers w ON a.worker_id = w.worker_id WHERE 1=1';
@@ -462,13 +571,13 @@ app.get('/admin/attendance', async (req, res) => {
   res.send(layout('Attendance Report', content));
 });
 
-app.get('/admin/attendance/clear', async (req, res) => {
+app.get('/admin/attendance/clear', requireAdmin, async (req, res) => {
   await pool.query('DELETE FROM attendance_logs');
   res.redirect('/admin/attendance');
 });
 
 // Admin Stock Inventory
-app.get('/admin/stock', async (req, res) => {
+app.get('/admin/stock', requireAdmin, async (req, res) => {
   const materials = await pool.query('SELECT * FROM materials ORDER BY material_name ASC');
   const history = await pool.query('SELECT st.*, m.material_name, m.unit FROM stock_transactions st JOIN materials m ON st.material_id = m.id ORDER BY st.created_at DESC LIMIT 20');
 
@@ -512,7 +621,7 @@ app.get('/admin/stock', async (req, res) => {
   res.send(layout('Stock Inventory', content));
 });
 
-app.get('/admin/stock/add', (req, res) => {
+app.get('/admin/stock/add', requireAdmin, (req, res) => {
   let content = `
     <header><div class="brand"><h2>Add Material</h2></div></header>
     ${adminNav}
@@ -537,7 +646,7 @@ app.get('/admin/stock/add', (req, res) => {
   res.send(layout('Add Material', content));
 });
 
-app.post('/admin/stock/add', async (req, res) => {
+app.post('/admin/stock/add', requireAdmin, async (req, res) => {
   const { material_name, category, unit, current_quantity, minimum_stock_level, notes } = req.body;
   const client = await pool.connect();
   try {
@@ -562,8 +671,8 @@ app.post('/admin/stock/add', async (req, res) => {
 });
 
 // Advance Money Management
-app.get('/admin/advance', async (req, res) => {
-  const workers = await pool.query('SELECT * FROM workers WHERE status = \'Active\'');
+app.get('/admin/advance', requireAdmin, async (req, res) => {
+  const workers = await pool.query("SELECT * FROM workers WHERE status = 'Active'");
   const advances = await pool.query('SELECT am.*, w.full_name FROM advance_money am JOIN workers w ON am.worker_id = w.worker_id ORDER BY am.advance_date DESC');
   const phNow = getPHTime();
 
@@ -597,16 +706,14 @@ app.get('/admin/advance', async (req, res) => {
   res.send(layout('Advance Money', content));
 });
 
-app.post('/admin/advance', async (req, res) => {
+app.post('/admin/advance', requireAdmin, async (req, res) => {
   const { worker_id, amount, advance_date, notes } = req.body;
   await pool.query('INSERT INTO advance_money (worker_id, amount, advance_date, notes) VALUES ($1, $2, $3, $4)', [worker_id, amount, advance_date, notes]);
   res.redirect('/admin/advance');
 });
 
-// ==========================================
-// DEDUCTIONS MANAGEMENT (Meal, etc.)
-// ==========================================
-app.get('/admin/deductions', async (req, res) => {
+// Deductions Management (Meal, etc.)
+app.get('/admin/deductions', requireAdmin, async (req, res) => {
   const workers = await pool.query("SELECT * FROM workers WHERE status = 'Active'");
   const deductionsList = await pool.query('SELECT d.*, w.full_name FROM deductions d JOIN workers w ON d.worker_id = w.worker_id ORDER BY d.deduction_date DESC');
   const phNow = getPHTime();
@@ -652,7 +759,7 @@ app.get('/admin/deductions', async (req, res) => {
   res.send(layout('Deductions', content));
 });
 
-app.post('/admin/deductions', async (req, res) => {
+app.post('/admin/deductions', requireAdmin, async (req, res) => {
   const { worker_id, deduction_name, amount, deduction_date, notes } = req.body;
   await pool.query(
     'INSERT INTO deductions (worker_id, deduction_name, amount, deduction_date, notes) VALUES ($1, $2, $3, $4, $5)',
@@ -661,8 +768,8 @@ app.post('/admin/deductions', async (req, res) => {
   res.redirect('/admin/deductions');
 });
 
-// Salary Calculation Report (Per Day / Full Day or Half Day Logic)
-app.get('/admin/salary', async (req, res) => {
+// Salary Calculation Report
+app.get('/admin/salary', requireAdmin, async (req, res) => {
   const settings = await getSettings();
   const workers = await pool.query('SELECT * FROM workers');
 
@@ -673,7 +780,6 @@ app.get('/admin/salary', async (req, res) => {
   let grandTotalNet = 0;
 
   for (let w of workers.rows) {
-    // Group attendance logs by date to check if Full Day (4 scans) or Half Day (2 scans)
     const attRes = await pool.query(
       'SELECT attendance_date, COUNT(*) as scan_count FROM attendance_logs WHERE worker_id = $1 GROUP BY attendance_date', 
       [w.worker_id]
@@ -683,19 +789,16 @@ app.get('/admin/salary', async (req, res) => {
     for (let row of attRes.rows) {
       let scans = parseInt(row.scan_count);
       if (scans >= 4) {
-        totalEquivalentDays += 1.0; // Full day
+        totalEquivalentDays += 1.0;
       } else if (scans >= 2) {
-        totalEquivalentDays += 0.5; // Half day
+        totalEquivalentDays += 0.5;
       }
     }
 
     let totalSalary = totalEquivalentDays * parseFloat(w.daily_rate);
-
-    // Get total advance money
     const advRes = await pool.query('SELECT SUM(amount) as total_adv FROM advance_money WHERE worker_id = $1', [w.worker_id]);
     let totalAdvance = parseFloat(advRes.rows[0].total_adv) || 0;
 
-    // Get total deductions (Meal, etc.)
     const dedRes = await pool.query('SELECT SUM(amount) as total_ded FROM deductions WHERE worker_id = $1', [w.worker_id]);
     let totalDeductions = parseFloat(dedRes.rows[0].total_ded) || 0;
 
@@ -721,7 +824,7 @@ app.get('/admin/salary', async (req, res) => {
     <header>
       <div class="brand">
         ${settings.company_logo ? `<img src="${settings.company_logo}" alt="Logo">` : ''}
-        <h2>${settings.company_name} - Salary & Payroll Summary (Per Day Calculation)</h2>
+        <h2>${settings.company_name} - Salary & Payroll Summary</h2>
       </div>
     </header>
     ${adminNav}
@@ -732,13 +835,13 @@ app.get('/admin/salary', async (req, res) => {
       </div>
       <div style="display: flex; gap: 10px;" class="no-print">
         <button onclick="window.print()" class="btn">Print Summary Report</button>
-        <a href="/admin/salary/reset" class="btn btn-danger" onclick="return confirm('WARNING: This will clear all attendance logs, advance payments, and deductions, resetting workers salary data to ₱0 for the next cutoff. Proceed?');">Process Payout & Reset to 0</a>
+        <a href="/admin/salary/reset" class="btn btn-danger" onclick="return confirm('WARNING: This will clear all attendance logs, advance payments, and deductions. Proceed?');">Process Payout & Reset to 0</a>
       </div>
     </div>
     <div class="card">
       <h3>Worker Salary Breakdown</h3>
       <table>
-        <tr><th>ID</th><th>Name</th><th>Daily Rate</th><th>Total Days Worked (Full/Half)</th><th>Gross Salary</th><th>Advance</th><th>Deductions (Meal, etc.)</th><th>Net Salary</th></tr>
+        <tr><th>ID</th><th>Name</th><th>Daily Rate</th><th>Total Days (Full/Half)</th><th>Gross Salary</th><th>Advance</th><th>Deductions</th><th>Net Salary</th></tr>
         ${salaryData.map(s => `
           <tr>
             <td>${s.worker_id}</td>
@@ -764,7 +867,7 @@ app.get('/admin/salary', async (req, res) => {
   res.send(layout('Salary Calculation', content));
 });
 
-app.get('/admin/salary/reset', async (req, res) => {
+app.get('/admin/salary/reset', requireAdmin, async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -781,7 +884,7 @@ app.get('/admin/salary/reset', async (req, res) => {
 });
 
 // Announcements Management
-app.get('/admin/announcements', async (req, res) => {
+app.get('/admin/announcements', requireAdmin, async (req, res) => {
   const anns = await pool.query('SELECT * FROM announcements ORDER BY created_at DESC');
   let content = `
     <header><div class="brand"><h2>Announcements</h2></div></header>
@@ -804,14 +907,14 @@ app.get('/admin/announcements', async (req, res) => {
   res.send(layout('Announcements', content));
 });
 
-app.post('/admin/announcements', async (req, res) => {
+app.post('/admin/announcements', requireAdmin, async (req, res) => {
   const { title, content } = req.body;
   await pool.query('INSERT INTO announcements (title, content) VALUES ($1, $2)', [title, content]);
   res.redirect('/admin/announcements');
 });
 
 // Company Settings
-app.get('/admin/settings', async (req, res) => {
+app.get('/admin/settings', requireAdmin, async (req, res) => {
   const settings = await getSettings();
   let content = `
     <header><div class="brand"><h2>Company Settings</h2></div></header>
@@ -835,7 +938,7 @@ app.get('/admin/settings', async (req, res) => {
   res.send(layout('Company Settings', content));
 });
 
-app.post('/admin/settings', async (req, res) => {
+app.post('/admin/settings', requireAdmin, async (req, res) => {
   const { company_name, company_logo, company_address, contact_number, default_meal_deduction } = req.body;
   await pool.query('UPDATE company_settings SET company_name = $1, company_logo = $2, company_address = $3, company_number = $4, default_meal_deduction = $5 WHERE id = 1',
     [company_name, company_logo, company_address, contact_number, default_meal_deduction]);
@@ -843,7 +946,7 @@ app.post('/admin/settings', async (req, res) => {
 });
 
 // Work Schedule & Time Windows Configuration
-app.get('/admin/schedule', async (req, res) => {
+app.get('/admin/schedule', requireAdmin, async (req, res) => {
   const schedRes = await pool.query('SELECT * FROM work_schedules LIMIT 1');
   const sched = schedRes.rows[0];
   let content = `
@@ -878,7 +981,7 @@ app.get('/admin/schedule', async (req, res) => {
   res.send(layout('Work Schedule', content));
 });
 
-app.post('/admin/schedule', async (req, res) => {
+app.post('/admin/schedule', requireAdmin, async (req, res) => {
   const { morning_in_start, morning_in_end, morning_out_start, morning_out_end, afternoon_in_start, afternoon_in_end, afternoon_out_start, afternoon_out_end } = req.body;
   await pool.query(`UPDATE work_schedules SET morning_in_start = $1, morning_in_end = $2, morning_out_start = $3, morning_out_end = $4, afternoon_in_start = $5, afternoon_in_end = $6, afternoon_out_start = $7, afternoon_out_end = $8 WHERE id = 1`,
     [morning_in_start, morning_in_end, morning_out_start, morning_out_end, afternoon_in_start, afternoon_in_end, afternoon_out_start, afternoon_out_end]);
@@ -1168,7 +1271,7 @@ app.post('/api/attendance/check', async (req, res) => {
   const { worker_id, attendance_type } = req.body;
   const client = await pool.connect();
   try {
-    const workerRes = await client.query('SELECT * FROM workers WHERE worker_id = $1 AND status = \'Active\'', [worker_id]);
+    const workerRes = await client.query("SELECT * FROM workers WHERE worker_id = $1 AND status = 'Active'", [worker_id]);
     if (workerRes.rows.length === 0) {
       return res.json({ success: false, message: 'Worker not found or inactive.' });
     }
@@ -1176,9 +1279,8 @@ app.post('/api/attendance/check', async (req, res) => {
     
     const ph = getPHTime();
     const today = ph.date;
-    const currentTime = ph.time.substring(0, 5); // HH:MM format
+    const currentTime = ph.time.substring(0, 5);
 
-    // Get schedule time windows
     const schedRes = await client.query('SELECT * FROM work_schedules LIMIT 1');
     const sched = schedRes.rows[0];
 
@@ -1214,7 +1316,7 @@ app.post('/api/attendance/check', async (req, res) => {
       timeStart = sched.afternoon_out_start || '17:00';
       timeEnd = sched.afternoon_out_end || '18:00';
     } else {
-      return res.json({ success: false, message: 'Tapos na ang 4 na beses na pag-scan mo ngayong araw (Complete na ang Umaga at Hapon).' });
+      return res.json({ success: false, message: 'Tapos na ang 4 na beses na pag-scan mo ngayong araw.' });
     }
 
     if (attendance_type !== expectedType) {
@@ -1224,7 +1326,6 @@ app.post('/api/attendance/check', async (req, res) => {
       });
     }
 
-    // Time Window Validation Check
     if (currentTime < timeStart || currentTime > timeEnd) {
       return res.json({
         success: false,
@@ -1240,7 +1341,7 @@ app.post('/api/attendance/check', async (req, res) => {
   }
 });
 
-// API Endpoint Step 2: Commit Attendance and Handle Meal Deduction Choice
+// API Endpoint Step 2: Commit Attendance
 app.post('/api/attendance/commit', async (req, res) => {
   const { worker_id, attendance_type, is_eating } = req.body;
   const client = await pool.connect();

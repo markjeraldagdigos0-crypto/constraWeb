@@ -1044,7 +1044,10 @@ app.post('/scanner/stock-out', async (req, res) => {
   }
   res.redirect('/scanner');
 });
-
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
+
+// Increase keepAlive and headers timeout to prevent proxy timeout / 502 errors
+server.keepAliveTimeout = 28800000; // 120 seconds
+server.headersTimeout = 28800000;   // 120 seconds

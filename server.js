@@ -51,16 +51,8 @@ async function initDB() {
         username VARCHAR(100) UNIQUE NOT NULL,
         password TEXT NOT NULL,
         full_name VARCHAR(255),
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
-
-      CREATE TABLE IF NOT EXISTS officer_users (
-        id SERIAL PRIMARY KEY,
-        username VARCHAR(100) UNIQUE NOT NULL,
-        password TEXT NOT NULL,
-        full_name VARCHAR(255),
-        role VARCHAR(50) NOT NULL, -- 'scanner' or 'payroll'
-        status VARCHAR(20) DEFAULT 'Pending', -- 'Pending' or 'Approved'
+        role VARCHAR(50) DEFAULT 'admin',
+        is_approved BOOLEAN DEFAULT TRUE,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
 
@@ -140,6 +132,8 @@ async function initDB() {
     // Auto-migrate missing columns
     await pool.query(`
       ALTER TABLE workers ADD COLUMN IF NOT EXISTS password TEXT NOT NULL DEFAULT '';
+      ALTER TABLE admin_users ADD COLUMN IF NOT EXISTS role VARCHAR(50) DEFAULT 'admin';
+      ALTER TABLE admin_users ADD COLUMN IF NOT EXISTS is_approved BOOLEAN DEFAULT TRUE;
       ALTER TABLE work_schedules ADD COLUMN IF NOT EXISTS morning_in_start VARCHAR(10) DEFAULT '06:00';
       ALTER TABLE work_schedules ADD COLUMN IF NOT EXISTS morning_in_end VARCHAR(10) DEFAULT '07:00';
       ALTER TABLE work_schedules ADD COLUMN IF NOT EXISTS morning_out_start VARCHAR(10) DEFAULT '11:30';
@@ -174,27 +168,26 @@ async function getSettings() {
 }
 
 function requireAdmin(req, res, next) {
-  if (req.session && req.session.adminId) {
+  if (req.session && req.session.adminId && req.session.role === 'admin') {
     return next();
   }
   res.redirect('/admin/login');
 }
 
 function requirePayroll(req, res, next) {
-  if (req.session && req.session.payrollId) {
+  if (req.session && req.session.adminId && (req.session.role === 'admin' || req.session.role === 'payroll')) {
     return next();
   }
   res.redirect('/payroll/login');
 }
 
 function requireScanner(req, res, next) {
-  if (req.session && req.session.scannerId) {
+  if (req.session && req.session.adminId && (req.session.role === 'admin' || req.session.role === 'scanner')) {
     return next();
   }
   res.redirect('/scanner/login');
 }
 
-// Helper to convert 24h to 12h format for display
 function formatTimeTo12Hour(time24) {
   if (!time24) return '';
   const parts = time24.split(':');
@@ -274,178 +267,14 @@ app.get('/', async (req, res) => {
         <a href="/admin/login" class="btn" style="padding: 15px 30px; font-size: 16px;">ADMIN PORTAL</a>
         <a href="/payroll/login" class="btn btn-warning" style="padding: 15px 30px; font-size: 16px;">PAYROLL PORTAL</a>
         <a href="/scanner/login" class="btn btn-success" style="padding: 15px 30px; font-size: 16px;">SCANNER PORTAL</a>
-        <a href="/worker/login" class="btn" style="background: #475569; padding: 15px 30px; font-size: 16px;">WORKER PORTAL</a>
+        <a href="/worker/login" class="btn" style="background: var(--primary); padding: 15px 30px; font-size: 16px;">WORKER PORTAL</a>
       </div>
     </div>
   `;
   res.send(layout(settings.company_name + ' - Main', html));
 });
 
-// --- OFFICER REGISTRATION & LOGIN (Scanner & Payroll require Admin Approval) ---
-app.get('/officer/register', async (req, res) => {
-  const settings = await getSettings();
-  const error = req.query.error || '';
-  const success = req.query.success || '';
-
-  let content = `
-    <div style="max-width: 400px; margin: 30px auto;" class="card">
-      <h2 style="text-align: center; margin-bottom: 20px;">Officer Registration</h2>
-      <p style="text-align:center; font-size:13px; color:#64748b; margin-bottom:15px;">Ang iyong account ay mangangailangan muna ng approval ng Admin bago ka makapag-login.</p>
-      ${error ? `<div class="alert-box alert-danger">${error}</div>` : ''}
-      ${success ? `<div class="alert-box alert-success">${success}</div>` : ''}
-      <form action="/officer/register" method="POST">
-        <label>Full Name</label>
-        <input type="text" name="full_name" required>
-        <label>Role / Position</label>
-        <select name="role" required>
-          <option value="scanner">Scanner Officer</option>
-          <option value="payroll">Payroll Officer</option>
-        </select>
-        <label>Username</label>
-        <input type="text" name="username" required>
-        <label>Password</label>
-        <input type="password" name="password" required>
-        <button type="submit" class="btn btn-success" style="width: 100%; padding: 12px; margin-bottom: 15px;">Register Officer Account</button>
-      </form>
-      <div style="text-align: center; font-size: 14px; display:flex; justify-content:space-between;">
-        <a href="/payroll/login">Payroll Login</a>
-        <a href="/scanner/login">Scanner Login</a>
-      </div>
-    </div>
-  `;
-  res.send(layout(settings.company_name + ' - Officer Register', content));
-});
-
-app.post('/officer/register', async (req, res) => {
-  const { full_name, role, username, password } = req.body;
-  try {
-    const existing = await pool.query('SELECT * FROM officer_users WHERE username = $1', [username]);
-    if (existing.rows.length > 0) {
-      return res.redirect('/officer/register?error=Username is already taken.');
-    }
-
-    const hashedPassword = await bcrypt.hash(password, 10);
-    await pool.query('INSERT INTO officer_users (username, password, full_name, role, status) VALUES ($1, $2, $3, $4, $5)', [username, hashedPassword, full_name, role, 'Pending']);
-    res.redirect('/officer/register?success=Account created successfully! Hintayin ma-approve ng Admin.');
-  } catch (err) {
-    res.redirect('/officer/register?error=Server error during registration.');
-  }
-});
-
-// SCANNER LOGIN & PORTAL GATEWAY
-app.get('/scanner/login', async (req, res) => {
-  const settings = await getSettings();
-  const error = req.query.error || '';
-  const success = req.query.success || '';
-
-  let content = `
-    <div style="max-width: 400px; margin: 50px auto;" class="card">
-      <h2 style="text-align: center; margin-bottom: 20px;">Scanner Officer Login</h2>
-      ${error ? `<div class="alert-box alert-danger">${error}</div>` : ''}
-      ${success ? `<div class="alert-box alert-success">${success}</div>` : ''}
-      <form action="/scanner/login" method="POST">
-        <label>Username</label>
-        <input type="text" name="username" required>
-        <label>Password</label>
-        <input type="password" name="password" required>
-        <button type="submit" class="btn btn-success" style="width: 100%; padding: 12px; margin-bottom: 15px;">Login Scanner</button>
-      </form>
-      <div style="text-align: center; font-size: 14px;">
-        Wala pang account? <a href="/officer/register" style="color: var(--accent); font-weight: bold;">Mag-register dito</a>
-      </div>
-    </div>
-  `;
-  res.send(layout(settings.company_name + ' - Scanner Login', content));
-});
-
-app.post('/scanner/login', async (req, res) => {
-  const { username, password } = req.body;
-  try {
-    const result = await pool.query("SELECT * FROM officer_users WHERE username = $1 AND role = 'scanner'", [username]);
-    if (result.rows.length === 0) {
-      return res.redirect('/scanner/login?error=Invalid username or not a scanner officer.');
-    }
-    const officer = result.rows[0];
-    if (officer.status !== 'Approved') {
-      return res.redirect('/scanner/login?error=Ang iyong account ay naghihintay pa ng Approval mula sa Admin.');
-    }
-    const match = await bcrypt.compare(password, officer.password);
-    if (!match) {
-      return res.redirect('/scanner/login?error=Invalid password.');
-    }
-
-    req.session.scannerId = officer.id;
-    req.session.scannerUsername = officer.username;
-    res.redirect('/scanner');
-  } catch (err) {
-    res.redirect('/scanner/login?error=Server error during login.');
-  }
-});
-
-app.get('/scanner/logout', (req, res) => {
-  req.session.destroy(() => {
-    res.redirect('/scanner/login');
-  });
-});
-
-// PAYROLL LOGIN & PORTAL GATEWAY
-app.get('/payroll/login', async (req, res) => {
-  const settings = await getSettings();
-  const error = req.query.error || '';
-  const success = req.query.success || '';
-
-  let content = `
-    <div style="max-width: 400px; margin: 50px auto;" class="card">
-      <h2 style="text-align: center; margin-bottom: 20px;">Payroll Officer Login</h2>
-      ${error ? `<div class="alert-box alert-danger">${error}</div>` : ''}
-      ${success ? `<div class="alert-box alert-success">${success}</div>` : ''}
-      <form action="/payroll/login" method="POST">
-        <label>Username</label>
-        <input type="text" name="username" required>
-        <label>Password</label>
-        <input type="password" name="password" required>
-        <button type="submit" class="btn btn-warning" style="width: 100%; padding: 12px; margin-bottom: 15px;">Login Payroll</button>
-      </form>
-      <div style="text-align: center; font-size: 14px;">
-        Wala pang account? <a href="/officer/register" style="color: var(--accent); font-weight: bold;">Mag-register dito</a>
-      </div>
-    </div>
-  `;
-  res.send(layout(settings.company_name + ' - Payroll Login', content));
-});
-
-app.post('/payroll/login', async (req, res) => {
-  const { username, password } = req.body;
-  try {
-    const result = await pool.query("SELECT * FROM officer_users WHERE username = $1 AND role = 'payroll'", [username]);
-    if (result.rows.length === 0) {
-      return res.redirect('/payroll/login?error=Invalid username or not a payroll officer.');
-    }
-    const officer = result.rows[0];
-    if (officer.status !== 'Approved') {
-      return res.redirect('/payroll/login?error=Ang iyong account ay naghihintay pa ng Approval mula sa Admin.');
-    }
-    const match = await bcrypt.compare(password, officer.password);
-    if (!match) {
-      return res.redirect('/payroll/login?error=Invalid password.');
-    }
-
-    req.session.payrollId = officer.id;
-    req.session.payrollUsername = officer.username;
-    res.redirect('/payroll');
-  } catch (err) {
-    res.redirect('/payroll/login?error=Server error during login.');
-  }
-});
-
-app.get('/payroll/logout', (req, res) => {
-  req.session.destroy(() => {
-    res.redirect('/payroll/login');
-  });
-});
-
-
-// ADMIN AUTHENTICATION ROUTES
+// ADMIN AUTHENTICATION & APPROVAL ROUTES
 app.get('/admin/login', async (req, res) => {
   const settings = await getSettings();
   const error = req.query.error || '';
@@ -464,7 +293,8 @@ app.get('/admin/login', async (req, res) => {
         <button type="submit" class="btn" style="width: 100%; padding: 12px; margin-bottom: 15px;">Login</button>
       </form>
       <div style="text-align: center; font-size: 14px;">
-        Wala pang account? <a href="/admin/register" style="color: var(--accent); font-weight: bold;">Mag-register dito</a>
+        Wala pang Admin account? <a href="/admin/register" style="color: var(--accent); font-weight: bold;">Mag-register dito</a><br><br>
+        Gusto mo bang mag-register bilang <a href="/payroll/register" style="color: var(--warning);">Payroll Officer</a> o <a href="/scanner/register" style="color: var(--success);">Scanner Officer</a>?
       </div>
     </div>
   `;
@@ -474,7 +304,7 @@ app.get('/admin/login', async (req, res) => {
 app.post('/admin/login', async (req, res) => {
   const { username, password } = req.body;
   try {
-    const result = await pool.query('SELECT * FROM admin_users WHERE username = $1', [username]);
+    const result = await pool.query('SELECT * FROM admin_users WHERE username = $1 AND role = $2', [username, 'admin']);
     if (result.rows.length === 0) {
       return res.redirect('/admin/login?error=Invalid username or password.');
     }
@@ -486,6 +316,7 @@ app.post('/admin/login', async (req, res) => {
 
     req.session.adminId = admin.id;
     req.session.adminUsername = admin.username;
+    req.session.role = 'admin';
     res.redirect('/admin');
   } catch (err) {
     res.redirect('/admin/login?error=Server error during login.');
@@ -526,10 +357,194 @@ app.post('/admin/register', async (req, res) => {
     }
 
     const hashedPassword = await bcrypt.hash(password, 10);
-    await pool.query('INSERT INTO admin_users (username, password, full_name) VALUES ($1, $2, $3)', [username, hashedPassword, full_name]);
-    res.redirect('/admin/login?success=Account created successfully! Please login.');
+    await pool.query('INSERT INTO admin_users (username, password, full_name, role, is_approved) VALUES ($1, $2, $3, $4, $5)', [username, hashedPassword, full_name, 'admin', true]);
+    res.redirect('/admin/login?success=Admin account created successfully! Please login.');
   } catch (err) {
     res.redirect('/admin/register?error=Server error during registration.');
+  }
+});
+
+// PAYROLL OFFICER REGISTRATION & LOGIN
+app.get('/payroll/login', async (req, res) => {
+  const settings = await getSettings();
+  const error = req.query.error || '';
+  const success = req.query.success || '';
+
+  let content = `
+    <div style="max-width: 400px; margin: 50px auto;" class="card">
+      <h2 style="text-align: center; margin-bottom: 20px;">Payroll Officer Login</h2>
+      ${error ? `<div class="alert-box alert-danger">${error}</div>` : ''}
+      ${success ? `<div class="alert-box alert-success">${success}</div>` : ''}
+      <form action="/payroll/login" method="POST">
+        <label>Username</label>
+        <input type="text" name="username" required>
+        <label>Password</label>
+        <input type="password" name="password" required>
+        <button type="submit" class="btn btn-warning" style="width: 100%; padding: 12px; margin-bottom: 15px;">Login as Payroll</button>
+      </form>
+      <div style="text-align: center; font-size: 14px;">
+        Wala pang account? <a href="/payroll/register" style="color: var(--warning); font-weight: bold;">Mag-register dito</a><br>
+        <a href="/" style="color: #64748b;">Bumalik sa Home</a>
+      </div>
+    </div>
+  `;
+  res.send(layout(settings.company_name + ' - Payroll Login', content));
+});
+
+app.post('/payroll/login', async (req, res) => {
+  const { username, password } = req.body;
+  try {
+    const result = await pool.query('SELECT * FROM admin_users WHERE username = $1 AND role = $2', [username, 'payroll']);
+    if (result.rows.length === 0) {
+      return res.redirect('/payroll/login?error=Invalid username or account not found.');
+    }
+    const user = result.rows[0];
+    if (!user.is_approved) {
+      return res.redirect('/payroll/login?error=Ang iyong account ay naghihintay pa ng pag-apruba ng Admin.');
+    }
+    const match = await bcrypt.compare(password, user.password);
+    if (!match) {
+      return res.redirect('/payroll/login?error=Invalid password.');
+    }
+
+    req.session.adminId = user.id;
+    req.session.adminUsername = user.username;
+    req.session.role = 'payroll';
+    res.redirect('/payroll/dashboard');
+  } catch (err) {
+    res.redirect('/payroll/login?error=Server error during login.');
+  }
+});
+
+app.get('/payroll/register', async (req, res) => {
+  const settings = await getSettings();
+  const error = req.query.error || '';
+
+  let content = `
+    <div style="max-width: 400px; margin: 50px auto;" class="card">
+      <h2 style="text-align: center; margin-bottom: 20px;">Payroll Officer Registration</h2>
+      ${error ? `<div class="alert-box alert-danger">${error}</div>` : ''}
+      <form action="/payroll/register" method="POST">
+        <label>Full Name</label>
+        <input type="text" name="full_name" required>
+        <label>Username</label>
+        <input type="text" name="username" required>
+        <label>Password</label>
+        <input type="password" name="password" required>
+        <button type="submit" class="btn btn-warning" style="width: 100%; padding: 12px; margin-bottom: 15px;">Register (Needs Admin Approval)</button>
+      </form>
+      <div style="text-align: center; font-size: 14px;">
+        May account na? <a href="/payroll/login" style="color: var(--warning); font-weight: bold;">Mag-login dito</a>
+      </div>
+    </div>
+  `;
+  res.send(layout(settings.company_name + ' - Payroll Register', content));
+});
+
+app.post('/payroll/register', async (req, res) => {
+  const { full_name, username, password } = req.body;
+  try {
+    const existing = await pool.query('SELECT * FROM admin_users WHERE username = $1', [username]);
+    if (existing.rows.length > 0) {
+      return res.redirect('/payroll/register?error=Username is already taken.');
+    }
+    const hashedPassword = await bcrypt.hash(password, 10);
+    await pool.query('INSERT INTO admin_users (username, password, full_name, role, is_approved) VALUES ($1, $2, $3, $4, $5)', [username, hashedPassword, full_name, 'payroll', false]);
+    res.redirect('/payroll/login?success=Matagumpay na nakapag-register! Mangyaring maghintay na ma-approve ito ng Admin.');
+  } catch (err) {
+    res.redirect('/payroll/register?error=Server error during registration.');
+  }
+});
+
+// SCANNER OFFICER REGISTRATION & LOGIN
+app.get('/scanner/login', async (req, res) => {
+  const settings = await getSettings();
+  const error = req.query.error || '';
+  const success = req.query.success || '';
+
+  let content = `
+    <div style="max-width: 400px; margin: 50px auto;" class="card">
+      <h2 style="text-align: center; margin-bottom: 20px;">Scanner Officer Login</h2>
+      ${error ? `<div class="alert-box alert-danger">${error}</div>` : ''}
+      ${success ? `<div class="alert-box alert-success">${success}</div>` : ''}
+      <form action="/scanner/login" method="POST">
+        <label>Username</label>
+        <input type="text" name="username" required>
+        <label>Password</label>
+        <input type="password" name="password" required>
+        <button type="submit" class="btn btn-success" style="width: 100%; padding: 12px; margin-bottom: 15px;">Login as Scanner</button>
+      </form>
+      <div style="text-align: center; font-size: 14px;">
+        Wala pang account? <a href="/scanner/register" style="color: var(--success); font-weight: bold;">Mag-register dito</a><br>
+        <a href="/" style="color: #64748b;">Bumalik sa Home</a>
+      </div>
+    </div>
+  `;
+  res.send(layout(settings.company_name + ' - Scanner Login', content));
+});
+
+app.post('/scanner/login', async (req, res) => {
+  const { username, password } = req.body;
+  try {
+    const result = await pool.query('SELECT * FROM admin_users WHERE username = $1 AND role = $2', [username, 'scanner']);
+    if (result.rows.length === 0) {
+      return res.redirect('/scanner/login?error=Invalid username or account not found.');
+    }
+    const user = result.rows[0];
+    if (!user.is_approved) {
+      return res.redirect('/scanner/login?error=Ang iyong account ay naghihintay pa ng pag-apruba ng Admin.');
+    }
+    const match = await bcrypt.compare(password, user.password);
+    if (!match) {
+      return res.redirect('/scanner/login?error=Invalid password.');
+    }
+
+    req.session.adminId = user.id;
+    req.session.adminUsername = user.username;
+    req.session.role = 'scanner';
+    res.redirect('/scanner');
+  } catch (err) {
+    res.redirect('/scanner/login?error=Server error during login.');
+  }
+});
+
+app.get('/scanner/register', async (req, res) => {
+  const settings = await getSettings();
+  const error = req.query.error || '';
+
+  let content = `
+    <div style="max-width: 400px; margin: 50px auto;" class="card">
+      <h2 style="text-align: center; margin-bottom: 20px;">Scanner Officer Registration</h2>
+      ${error ? `<div class="alert-box alert-danger">${error}</div>` : ''}
+      <form action="/scanner/register" method="POST">
+        <label>Full Name</label>
+        <input type="text" name="full_name" required>
+        <label>Username</label>
+        <input type="text" name="username" required>
+        <label>Password</label>
+        <input type="password" name="password" required>
+        <button type="submit" class="btn btn-success" style="width: 100%; padding: 12px; margin-bottom: 15px;">Register (Needs Admin Approval)</button>
+      </form>
+      <div style="text-align: center; font-size: 14px;">
+        May account na? <a href="/scanner/login" style="color: var(--success); font-weight: bold;">Mag-login dito</a>
+      </div>
+    </div>
+  `;
+  res.send(layout(settings.company_name + ' - Scanner Register', content));
+});
+
+app.post('/scanner/register', async (req, res) => {
+  const { full_name, username, password } = req.body;
+  try {
+    const existing = await pool.query('SELECT * FROM admin_users WHERE username = $1', [username]);
+    if (existing.rows.length > 0) {
+      return res.redirect('/scanner/register?error=Username is already taken.');
+    }
+    const hashedPassword = await bcrypt.hash(password, 10);
+    await pool.query('INSERT INTO admin_users (username, password, full_name, role, is_approved) VALUES ($1, $2, $3, $4, $5)', [username, hashedPassword, full_name, 'scanner', false]);
+    res.redirect('/scanner/login?success=Matagumpay na nakapag-register! Mangyaring maghintay na ma-approve ito ng Admin.');
+  } catch (err) {
+    res.redirect('/scanner/register?error=Server error during registration.');
   }
 });
 
@@ -539,11 +554,23 @@ app.get('/admin/logout', (req, res) => {
   });
 });
 
-// ADMIN PORTAL
+app.get('/payroll/logout', (req, res) => {
+  req.session.destroy(() => {
+    res.redirect('/payroll/login');
+  });
+});
+
+app.get('/scanner/logout', (req, res) => {
+  req.session.destroy(() => {
+    res.redirect('/scanner/login');
+  });
+});
+
+// ADMIN PORTAL & APPROVALS
 const adminNav = `
   <nav class="no-print">
     <a href="/admin">Dashboard</a>
-    <a href="/admin/officers">Officer Approvals</a>
+    <a href="/admin/approvals">Officer Approvals</a>
     <a href="/admin/workers">Workers</a>
     <a href="/admin/attendance">Attendance</a>
     <a href="/admin/advance">Advance Money</a>
@@ -562,8 +589,7 @@ app.get('/admin', requireAdmin, async (req, res) => {
   const phNow = getPHTime();
   const today = phNow.date;
   const presentToday = await pool.query('SELECT COUNT(DISTINCT worker_id) FROM attendance_logs WHERE attendance_date = $1', [today]);
-  const pendingOfficers = await pool.query("SELECT COUNT(*) FROM officer_users WHERE status = 'Pending'");
-  const recentAttendance = await pool.query('SELECT a.*, w.full_name FROM attendance_logs a JOIN workers w ON a.worker_id = w.worker_id ORDER BY a.created_at DESC LIMIT 5');
+  const pendingApprovals = await pool.query('SELECT COUNT(*) FROM admin_users WHERE is_approved = FALSE');
 
   let content = `
     <header>
@@ -581,41 +607,37 @@ app.get('/admin', requireAdmin, async (req, res) => {
         <p><strong>Present Today:</strong> ${presentToday.rows[0].count}</p>
       </div>
       <div class="card">
-        <h3>Officer Approvals</h3>
-        <p><strong>Pending Officer Requests:</strong> ${pendingOfficers.rows[0].count}</p>
-        <a href="/admin/officers" class="btn btn-warning" style="margin-top:10px;">Review Officers</a>
+        <h3>Pending Officer Approvals</h3>
+        <p><strong>Pending Accounts:</strong> ${pendingApprovals.rows[0].count}</p>
+        <a href="/admin/approvals" class="btn btn-warning" style="margin-top: 10px;">Review Accounts</a>
       </div>
-    </div>
-    <div class="card">
-      <h3>Recent Attendance Logs</h3>
-      <table>
-        <tr><th>Worker ID</th><th>Name</th><th>Type</th><th>Date</th><th>Time</th></tr>
-        ${recentAttendance.rows.map(r => `<tr><td>${r.worker_id}</td><td>${r.full_name}</td><td><span class="badge ${r.attendance_type === 'IN' ? 'badge-success' : 'badge-warning'}">${r.attendance_type}</span></td><td>${r.attendance_date.toISOString().split('T')[0]}</td><td>${r.attendance_time}</td></tr>`).join('')}
-      </table>
     </div>
   `;
   res.send(layout('Admin Dashboard', content));
 });
 
-// OFFICER APPROVALS ROUTE FOR ADMIN
-app.get('/admin/officers', requireAdmin, async (req, res) => {
-  const officers = await pool.query('SELECT * FROM officer_users ORDER BY status DESC, created_at DESC');
+app.get('/admin/approvals', requireAdmin, async (req, res) => {
+  const pendingUsers = await pool.query("SELECT * FROM admin_users WHERE role != 'admin' ORDER BY created_at DESC");
+
   let content = `
     <header><div class="brand"><h2>Officer Account Approvals</h2></div></header>
     ${adminNav}
     <div class="card">
-      <h3>Scanner & Payroll Officer Requests</h3>
+      <h3>Payroll & Scanner Officer Accounts</h3>
       <table>
         <tr><th>Name</th><th>Username</th><th>Role</th><th>Status</th><th>Actions</th></tr>
-        ${officers.rows.map(o => `
+        ${pendingUsers.rows.map(u => `
           <tr>
-            <td>${o.full_name}</td>
-            <td>${o.username}</td>
-            <td><span class="badge ${o.role === 'scanner' ? 'badge-success' : 'badge-warning'}">${o.role.toUpperCase()}</span></td>
-            <td><span class="badge ${o.status === 'Approved' ? 'badge-success' : 'badge-danger'}">${o.status}</span></td>
+            <td>${u.full_name}</td>
+            <td>${u.username}</td>
+            <td><span class="badge ${u.role === 'payroll' ? 'badge-warning' : 'badge-success'}">${u.role.toUpperCase()}</span></td>
+            <td><span class="badge ${u.is_approved ? 'badge-success' : 'badge-danger'}">${u.is_approved ? 'Approved' : 'Pending'}</span></td>
             <td>
-              ${o.status === 'Pending' ? `<a href="/admin/officers/approve/${o.id}" class="btn btn-success" style="padding:4px 8px; font-size:12px;">Approve</a>` : ''}
-              <a href="/admin/officers/delete/${o.id}" class="btn btn-danger" onclick="return confirm('Delete this officer account?');" style="padding:4px 8px; font-size:12px;">Delete</a>
+              ${u.is_approved ? 
+                `<a href="/admin/approvals/toggle/${u.id}" class="btn btn-danger" style="padding: 4px 8px; font-size: 12px;">Revoke</a>` : 
+                `<a href="/admin/approvals/toggle/${u.id}" class="btn btn-success" style="padding: 4px 8px; font-size: 12px;">Approve</a>`
+              }
+              <a href="/admin/approvals/delete/${u.id}" class="btn btn-danger" onclick="return confirm('Delete this account?');" style="padding: 4px 8px; font-size: 12px;">Delete</a>
             </td>
           </tr>
         `).join('')}
@@ -625,18 +647,23 @@ app.get('/admin/officers', requireAdmin, async (req, res) => {
   res.send(layout('Officer Approvals', content));
 });
 
-app.get('/admin/officers/approve/:id', requireAdmin, async (req, res) => {
+app.get('/admin/approvals/toggle/:id', requireAdmin, async (req, res) => {
   const { id } = req.params;
-  await pool.query("UPDATE officer_users SET status = 'Approved' WHERE id = $1", [id]);
-  res.redirect('/admin/officers');
+  const userRes = await pool.query('SELECT is_approved FROM admin_users WHERE id = $1', [id]);
+  if (userRes.rows.length > 0) {
+    const newStatus = !userRes.rows[0].is_approved;
+    await pool.query('UPDATE admin_users SET is_approved = $1 WHERE id = $2', [newStatus, id]);
+  }
+  res.redirect('/admin/approvals');
 });
 
-app.get('/admin/officers/delete/:id', requireAdmin, async (req, res) => {
+app.get('/admin/approvals/delete/:id', requireAdmin, async (req, res) => {
   const { id } = req.params;
-  await pool.query('DELETE FROM officer_users WHERE id = $1', [id]);
-  res.redirect('/admin/officers');
+  await pool.query('DELETE FROM admin_users WHERE id = $1', [id]);
+  res.redirect('/admin/approvals');
 });
 
+// WORKER MANAGEMENT & OTHER ADMIN ROUTES
 app.get('/admin/workers', requireAdmin, async (req, res) => {
   const search = req.query.search || '';
   const workers = await pool.query('SELECT * FROM workers WHERE full_name ILIKE $1 OR worker_id ILIKE $1 ORDER BY id DESC', [`%${search}%`]);
@@ -664,7 +691,7 @@ app.get('/admin/workers', requireAdmin, async (req, res) => {
               <a href="/admin/workers/qr/${w.worker_id}" class="btn" style="padding: 4px 8px; font-size: 12px;">QR Code</a>
               <a href="/admin/workers/edit/${w.worker_id}" class="btn btn-warning" style="padding: 4px 8px; font-size: 12px;">Edit</a>
               <a href="/admin/workers/toggle/${w.worker_id}" class="btn ${w.status === 'Active' ? 'btn-danger' : 'btn-success'}" style="padding: 4px 8px; font-size: 12px;">${w.status === 'Active' ? 'Deactivate' : 'Activate'}</a>
-              <a href="/admin/workers/delete/${w.worker_id}" class="btn btn-danger" onclick="return confirm('Are you sure you want to delete worker ${w.full_name}?');" style="padding: 4px 8px; font-size: 12px;">Delete</a>
+              <a href="/admin/workers/delete/${w.worker_id}" class="btn btn-danger" onclick="return confirm('Delete worker ${w.full_name}?');" style="padding: 4px 8px; font-size: 12px;">Delete</a>
             </td>
           </tr>
         `).join('')}
@@ -684,7 +711,7 @@ app.get('/admin/workers/register', requireAdmin, async (req, res) => {
     ${adminNav}
     <div class="card">
       <form action="/admin/workers/register" method="POST">
-        <label>Worker ID (Auto Generated - Default password will be same as ID)</label>
+        <label>Worker ID</label>
         <input type="text" value="${autoWorkerId}" disabled style="background: #e2e8f0;">
         <input type="hidden" name="worker_id" value="${autoWorkerId}">
         
@@ -707,12 +734,7 @@ app.get('/admin/workers/register', requireAdmin, async (req, res) => {
 
 app.post('/admin/workers/register', requireAdmin, async (req, res) => {
   const { worker_id, full_name, position, contact_number, daily_rate, assigned_project } = req.body;
-  
   try {
-    if (!worker_id) {
-      return res.status(400).send('Error: Worker ID is missing.');
-    }
-
     const defaultPassword = await bcrypt.hash(worker_id, 10);
     await pool.query(
       'INSERT INTO workers (worker_id, password, full_name, position, contact_number, daily_rate, assigned_project) VALUES ($1, $2, $3, $4, $5, $6, $7)',
@@ -720,12 +742,10 @@ app.post('/admin/workers/register', requireAdmin, async (req, res) => {
     );
     res.redirect(`/admin/workers/qr/${worker_id}`);
   } catch (err) {
-    console.error('Error registering worker:', err);
-    res.status(500).send('Database Error during worker registration: ' + err.message);
+    res.status(500).send('Database Error: ' + err.message);
   }
 });
 
-// EDIT WORKER ROUTES
 app.get('/admin/workers/edit/:worker_id', requireAdmin, async (req, res) => {
   const { worker_id } = req.params;
   const workerRes = await pool.query('SELECT * FROM workers WHERE worker_id = $1', [worker_id]);
@@ -739,22 +759,16 @@ app.get('/admin/workers/edit/:worker_id', requireAdmin, async (req, res) => {
       <form action="/admin/workers/edit/${worker.worker_id}" method="POST">
         <label>Worker ID</label>
         <input type="text" value="${worker.worker_id}" disabled style="background: #e2e8f0;">
-        
         <label>Full Name</label>
         <input type="text" name="full_name" value="${worker.full_name}" required>
-        
         <label>Position</label>
         <input type="text" name="position" value="${worker.position}" required>
-        
         <label>Contact Number</label>
         <input type="text" name="contact_number" value="${worker.contact_number || ''}">
-        
         <label>Daily Rate (₱)</label>
         <input type="number" step="0.01" name="daily_rate" value="${worker.daily_rate}" required>
-        
         <label>Assigned Project</label>
         <input type="text" name="assigned_project" value="${worker.assigned_project || ''}">
-        
         <button type="submit" class="btn btn-success">Update Worker</button>
         <a href="/admin/workers" class="btn btn-warning">Cancel</a>
       </form>
@@ -766,7 +780,6 @@ app.get('/admin/workers/edit/:worker_id', requireAdmin, async (req, res) => {
 app.post('/admin/workers/edit/:worker_id', requireAdmin, async (req, res) => {
   const { worker_id } = req.params;
   const { full_name, position, contact_number, daily_rate, assigned_project } = req.body;
-  
   try {
     await pool.query(
       'UPDATE workers SET full_name = $1, position = $2, contact_number = $3, daily_rate = $4, assigned_project = $5 WHERE worker_id = $6',
@@ -774,8 +787,7 @@ app.post('/admin/workers/edit/:worker_id', requireAdmin, async (req, res) => {
     );
     res.redirect('/admin/workers');
   } catch (err) {
-    console.error('Error updating worker:', err);
-    res.status(500).send('Database Error during worker update: ' + err.message);
+    res.status(500).send('Database Error: ' + err.message);
   }
 });
 
@@ -790,25 +802,15 @@ app.get('/admin/workers/qr/:worker_id', requireAdmin, async (req, res) => {
     <header><div class="brand"><h2>Worker QR Code</h2></div></header>
     ${adminNav}
     <div class="card" style="text-align: center; max-width: 450px; margin: 0 auto;">
-      ${settings.company_logo ? `<img src="${settings.company_logo}" style="max-height: 40px; margin-bottom: 10px;">` : ''}
       <h3>${settings.company_name}</h3>
-      <hr style="margin: 10px 0;">
-      <h2 style="margin: 10px 0;">${worker.full_name}</h2>
-      <p style="font-size: 16px; font-weight: bold; color: var(--accent);">ID: ${worker.worker_id}</p>
-      <p style="margin-bottom: 5px;">Position: ${worker.position}</p>
-      <p style="margin-bottom: 15px; font-size: 13px; color: #64748b;">Default Portal Password: <strong>${worker.worker_id}</strong></p>
+      <h2>${worker.full_name}</h2>
+      <p>ID: ${worker.worker_id}</p>
       <div id="qrcode" style="display: flex; justify-content: center; margin: 20px 0;"></div>
       <button onclick="window.print()" class="btn">Print QR Code</button>
-      <a href="/admin/workers" class="btn btn-warning">Back to Workers</a>
+      <a href="/admin/workers" class="btn btn-warning">Back</a>
     </div>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
-    <script>
-      new QRCode(document.getElementById("qrcode"), {
-        text: "${worker.worker_id}",
-        width: 200,
-        height: 200
-      });
-    </script>
+    <script>new QRCode(document.getElementById("qrcode"), { text: "${worker.worker_id}", width: 200, height: 200 });</script>
   `;
   res.send(layout('Worker QR', content));
 });
@@ -841,6 +843,7 @@ app.get('/admin/workers/delete/:worker_id', requireAdmin, async (req, res) => {
   res.redirect('/admin/workers');
 });
 
+// ATTENDANCE MANAGEMENT
 app.get('/admin/attendance', requireAdmin, async (req, res) => {
   const search = req.query.search || '';
   const dateFilter = req.query.date || '';
@@ -861,14 +864,11 @@ app.get('/admin/attendance', requireAdmin, async (req, res) => {
     <header><div class="brand"><h2>Attendance Logs</h2></div></header>
     ${adminNav}
     <div class="card">
-      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; flex-wrap: wrap; gap: 10px;">
-        <form action="/admin/attendance" method="GET" style="display: flex; gap: 10px; flex: 1; min-width: 280px; margin-bottom: 0;">
-          <input type="text" name="search" placeholder="Worker Name or ID..." value="${search}" style="flex: 1;">
-          <input type="date" name="date" value="${dateFilter}" style="width: 180px;">
-          <button type="submit" class="btn" style="height: 42px;">Filter</button>
-        </form>
-        <a href="/admin/attendance/clear" class="btn btn-danger" onclick="return confirm('Are you sure you want to clear ALL attendance logs?');" style="height: 42px; line-height: 22px;">Clear All Logs</a>
-      </div>
+      <form action="/admin/attendance" method="GET" style="display: flex; gap: 10px; margin-bottom: 15px;">
+        <input type="text" name="search" placeholder="Name or ID..." value="${search}">
+        <input type="date" name="date" value="${dateFilter}">
+        <button type="submit" class="btn">Filter</button>
+      </form>
       <table>
         <tr><th>Worker ID</th><th>Name</th><th>Date</th><th>Time</th><th>Type</th></tr>
         ${logs.rows.map(l => `<tr><td>${l.worker_id}</td><td>${l.full_name}</td><td>${l.attendance_date.toISOString().split('T')[0]}</td><td>${l.attendance_time}</td><td><span class="badge ${l.attendance_type === 'IN' ? 'badge-success' : 'badge-warning'}">${l.attendance_type}</span></td></tr>`).join('')}
@@ -878,11 +878,7 @@ app.get('/admin/attendance', requireAdmin, async (req, res) => {
   res.send(layout('Attendance Report', content));
 });
 
-app.get('/admin/attendance/clear', requireAdmin, async (req, res) => {
-  await pool.query('DELETE FROM attendance_logs');
-  res.redirect('/admin/attendance');
-});
-
+// ADVANCE MONEY
 app.get('/admin/advance', requireAdmin, async (req, res) => {
   const workers = await pool.query("SELECT * FROM workers WHERE status = 'Active'");
   const advances = await pool.query('SELECT am.*, w.full_name FROM advance_money am JOIN workers w ON am.worker_id = w.worker_id ORDER BY am.advance_date DESC');
@@ -892,7 +888,7 @@ app.get('/admin/advance', requireAdmin, async (req, res) => {
     <header><div class="brand"><h2>Advance Money Management</h2></div></header>
     ${adminNav}
     <div class="card">
-      <h3>Record Advance Money (Cash Advance)</h3>
+      <h3>Record Advance Money</h3>
       <form action="/admin/advance" method="POST">
         <label>Select Worker</label>
         <select name="worker_id" required>
@@ -924,6 +920,7 @@ app.post('/admin/advance', requireAdmin, async (req, res) => {
   res.redirect('/admin/advance');
 });
 
+// DEDUCTIONS
 app.get('/admin/deductions', requireAdmin, async (req, res) => {
   const workers = await pool.query("SELECT * FROM workers WHERE status = 'Active'");
   const deductionsList = await pool.query('SELECT d.*, w.full_name FROM deductions d JOIN workers w ON d.worker_id = w.worker_id ORDER BY d.deduction_date DESC');
@@ -933,20 +930,20 @@ app.get('/admin/deductions', requireAdmin, async (req, res) => {
     <header><div class="brand"><h2>Worker Deductions Management</h2></div></header>
     ${adminNav}
     <div class="card">
-      <h3>Add Deduction (e.g. Meal, Uniform, SSS, etc.)</h3>
+      <h3>Add Deduction</h3>
       <form action="/admin/deductions" method="POST">
         <label>Select Worker</label>
         <select name="worker_id" required>
           ${workers.rows.map(w => `<option value="${w.worker_id}">${w.full_name} (${w.worker_id})</option>`).join('')}
         </select>
-        <label>Deduction Type / Name (e.g. Meal Allowance, Uniform, SSS)</label>
-        <input type="text" name="deduction_name" placeholder="Meal Deduction" required>
+        <label>Deduction Type / Name</label>
+        <input type="text" name="deduction_name" placeholder="Meal Deduction / Uniform" required>
         <label>Amount (₱)</label>
         <input type="number" step="0.01" name="amount" required>
         <label>Date</label>
         <input type="date" name="deduction_date" value="${phNow.date}" required>
         <label>Notes</label>
-        <textarea name="notes" placeholder="Optional notes..."></textarea>
+        <textarea name="notes"></textarea>
         <button type="submit" class="btn btn-success">Save Deduction</button>
       </form>
     </div>
@@ -954,16 +951,7 @@ app.get('/admin/deductions', requireAdmin, async (req, res) => {
       <h3>Deductions History</h3>
       <table>
         <tr><th>Worker ID</th><th>Name</th><th>Deduction Name</th><th>Amount</th><th>Date</th><th>Notes</th></tr>
-        ${deductionsList.rows.map(d => `
-          <tr>
-            <td>${d.worker_id}</td>
-            <td>${d.full_name}</td>
-            <td>${d.deduction_name}</td>
-            <td>₱${parseFloat(d.amount).toFixed(2)}</td>
-            <td>${d.deduction_date.toISOString().split('T')[0]}</td>
-            <td>${d.notes || '-'}</td>
-          </tr>
-        `).join('')}
+        ${deductionsList.rows.map(d => `<tr><td>${d.worker_id}</td><td>${d.full_name}</td><td>${d.deduction_name}</td><td>₱${parseFloat(d.amount).toFixed(2)}</td><td>${d.deduction_date.toISOString().split('T')[0]}</td><td>${d.notes || '-'}</td></tr>`).join('')}
       </table>
     </div>
   `;
@@ -972,37 +960,33 @@ app.get('/admin/deductions', requireAdmin, async (req, res) => {
 
 app.post('/admin/deductions', requireAdmin, async (req, res) => {
   const { worker_id, deduction_name, amount, deduction_date, notes } = req.body;
-  await pool.query(
-    'INSERT INTO deductions (worker_id, deduction_name, amount, deduction_date, notes) VALUES ($1, $2, $3, $4, $5)',
-    [worker_id, deduction_name, amount, deduction_date, notes]
-  );
+  await pool.query('INSERT INTO deductions (worker_id, deduction_name, amount, deduction_date, notes) VALUES ($1, $2, $3, $4, $5)', [worker_id, deduction_name, amount, deduction_date, notes]);
   res.redirect('/admin/deductions');
 });
 
-app.get('/admin/salary', requireAdmin, async (req, res) => {
+// SALARY & PAYROLL PORTAL ROUTES (Accessible by Admin and Payroll Officer)
+const payrollNav = `
+  <nav class="no-print">
+    <a href="/payroll/dashboard" class="active">Payroll Summary</a>
+    <a href="/payroll/logout" style="background: var(--danger); color: white; margin-left: auto;">Logout</a>
+  </nav>
+`;
+
+app.get('/payroll/dashboard', requirePayroll, async (req, res) => {
   const settings = await getSettings();
   const workers = await pool.query('SELECT * FROM workers');
 
   let salaryData = [];
-  let grandTotalGross = 0;
-  let grandTotalAdvance = 0;
-  let grandTotalDeductions = 0;
   let grandTotalNet = 0;
 
   for (let w of workers.rows) {
-    const attRes = await pool.query(
-      'SELECT attendance_date, COUNT(*) as scan_count FROM attendance_logs WHERE worker_id = $1 GROUP BY attendance_date', 
-      [w.worker_id]
-    );
+    const attRes = await pool.query('SELECT attendance_date, COUNT(*) as scan_count FROM attendance_logs WHERE worker_id = $1 GROUP BY attendance_date', [w.worker_id]);
     
     let totalEquivalentDays = 0;
     for (let row of attRes.rows) {
       let scans = parseInt(row.scan_count);
-      if (scans >= 4) {
-        totalEquivalentDays += 1.0;
-      } else if (scans >= 2) {
-        totalEquivalentDays += 0.5;
-      }
+      if (scans >= 4) totalEquivalentDays += 1.0;
+      else if (scans >= 2) totalEquivalentDays += 0.5;
     }
 
     let totalSalary = totalEquivalentDays * parseFloat(w.daily_rate);
@@ -1015,43 +999,45 @@ app.get('/admin/salary', requireAdmin, async (req, res) => {
     let netSalary = totalSalary - totalAdvance - totalDeductions;
     if (netSalary < 0) netSalary = 0;
 
-    grandTotalGross += totalSalary;
-    grandTotalAdvance += totalAdvance;
-    grandTotalDeductions += totalDeductions;
+    let isPaid = (totalEquivalentDays === 0 && totalSalary === 0 && totalAdvance === 0 && totalDeductions === 0);
+
     grandTotalNet += netSalary;
 
     salaryData.push({
       ...w,
       totalEquivalentDays: totalEquivalentDays.toFixed(1),
-      totalSalary: totalSalary,
-      totalAdvance: totalAdvance,
-      totalDeductions: totalDeductions,
-      netSalary: netSalary
+      totalSalary,
+      totalAdvance,
+      totalDeductions,
+      netSalary,
+      isPaid
     });
   }
+
+  const roleNav = req.session.role === 'admin' ? adminNav : payrollNav;
 
   let content = `
     <header>
       <div class="brand">
         ${settings.company_logo ? `<img src="${settings.company_logo}" alt="Logo">` : ''}
-        <h2>${settings.company_name} - Salary & Payroll Summary</h2>
+        <h2>${settings.company_name} - Payroll Portal</h2>
       </div>
+      <div>Logged in as: <strong>${req.session.adminUsername} (${req.session.role.toUpperCase()})</strong></div>
     </header>
-    ${adminNav}
+    ${roleNav}
     <div class="card" style="display: flex; gap: 15px; flex-wrap: wrap; justify-content: space-between; align-items: center;">
       <div>
-        <h3>Payroll Summary Overview</h3>
-        <p>Kakailanganing Pera para sa Sahod (Net Payout): <strong style="color: var(--success); font-size: 18px;">₱${grandTotalNet.toFixed(2)}</strong></p>
+        <h3>Payroll Overview</h3>
+        <p>Total Net Payout: <strong style="color: var(--success); font-size: 18px;">₱${grandTotalNet.toFixed(2)}</strong></p>
       </div>
-      <div style="display: flex; gap: 10px;" class="no-print">
-        <button onclick="window.print()" class="btn">Print Summary Report</button>
-        <a href="/admin/salary/reset" class="btn btn-danger" onclick="return confirm('WARNING: This will clear all attendance logs, advance payments, and deductions. Proceed?');">Reset All Payroll Records</a>
+      <div class="no-print">
+        <button onclick="window.print()" class="btn">Print Payroll Report</button>
       </div>
     </div>
     <div class="card">
-      <h3>Worker Salary Breakdown</h3>
+      <h3>Worker Salary Breakdown & Status</h3>
       <table>
-        <tr><th>ID</th><th>Name</th><th>Daily Rate</th><th>Total Days</th><th>Gross Salary</th><th>Advance</th><th>Deductions</th><th>Net Salary</th></tr>
+        <tr><th>ID</th><th>Name</th><th>Daily Rate</th><th>Total Days</th><th>Gross</th><th>Advance</th><th>Deductions</th><th>Net Salary</th><th>Status / Action</th></tr>
         ${salaryData.map(s => `
           <tr>
             <td>${s.worker_id}</td>
@@ -1062,37 +1048,43 @@ app.get('/admin/salary', requireAdmin, async (req, res) => {
             <td>₱${s.totalAdvance.toFixed(2)}</td>
             <td>₱${s.totalDeductions.toFixed(2)}</td>
             <td><strong>₱${s.netSalary.toFixed(2)}</strong></td>
+            <td>
+              ${s.isPaid ? 
+                `<span class="badge badge-success">Naka-sahod na</span>` : 
+                `<a href="/payroll/pay/${s.worker_id}" class="btn btn-warning" onclick="return confirm('I-process at i-reset na ba ang sahod ni ${s.full_name}?');" style="padding: 4px 8px; font-size: 12px;">Sahudin & Reset</a>`
+              }
+            </td>
           </tr>
         `).join('')}
-        <tr style="background: #f1f5f9; font-weight: bold;">
-          <td colspan="4" style="text-align: right;">TOTAL:</td>
-          <td>₱${grandTotalGross.toFixed(2)}</td>
-          <td>₱${grandTotalAdvance.toFixed(2)}</td>
-          <td>₱${grandTotalDeductions.toFixed(2)}</td>
-          <td>₱${grandTotalNet.toFixed(2)}</td>
-        </tr>
       </table>
     </div>
   `;
-  res.send(layout('Salary Calculation', content));
+  res.send(layout('Payroll Portal', content));
 });
 
-app.get('/admin/salary/reset', requireAdmin, async (req, res) => {
+app.get('/admin/salary', requireAdmin, async (req, res) => {
+  res.redirect('/payroll/dashboard');
+});
+
+// Individual worker salary reset (Sahudin isa-isa)
+app.get('/payroll/pay/:worker_id', requirePayroll, async (req, res) => {
+  const { worker_id } = req.params;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    await client.query('DELETE FROM attendance_logs');
-    await client.query('DELETE FROM advance_money');
-    await client.query('DELETE FROM deductions');
+    await client.query('DELETE FROM attendance_logs WHERE worker_id = $1', [worker_id]);
+    await client.query('DELETE FROM advance_money WHERE worker_id = $1', [worker_id]);
+    await client.query('DELETE FROM deductions WHERE worker_id = $1', [worker_id]);
     await client.query('COMMIT');
-  } catch (e) {
+  } catch (err) {
     await client.query('ROLLBACK');
   } finally {
     client.release();
   }
-  res.redirect('/admin/salary');
+  res.redirect('/payroll/dashboard');
 });
 
+// ANNOUNCEMENTS
 app.get('/admin/announcements', requireAdmin, async (req, res) => {
   const anns = await pool.query('SELECT * FROM announcements ORDER BY created_at DESC');
   let content = `
@@ -1122,6 +1114,7 @@ app.post('/admin/announcements', requireAdmin, async (req, res) => {
   res.redirect('/admin/announcements');
 });
 
+// COMPANY SETTINGS & SCHEDULE
 app.get('/admin/settings', requireAdmin, async (req, res) => {
   const settings = await getSettings();
   let content = `
@@ -1148,51 +1141,36 @@ app.get('/admin/settings', requireAdmin, async (req, res) => {
 
 app.post('/admin/settings', requireAdmin, async (req, res) => {
   const { company_name, company_logo, company_address, contact_number, default_meal_deduction } = req.body;
-  try {
-    await pool.query(
-      'UPDATE company_settings SET company_name = $1, company_logo = $2, company_address = $3, company_address = $3, contact_number = $4, default_meal_deduction = $5 WHERE id = 1',
-      [company_name, company_logo, company_address, contact_number, default_meal_deduction]
-    );
-    res.redirect('/admin/settings');
-  } catch (err) {
-    console.error('Error saving settings:', err);
-    res.status(500).send('Database Error saving settings: ' + err.message);
-  }
+  await pool.query('UPDATE company_settings SET company_name = $1, company_logo = $2, company_address = $3, contact_number = $4, default_meal_deduction = $5 WHERE id = 1', [company_name, company_logo, company_address, contact_number, default_meal_deduction]);
+  res.redirect('/admin/settings');
 });
 
 app.get('/admin/schedule', requireAdmin, async (req, res) => {
   let schedRes = await pool.query('SELECT * FROM work_schedules LIMIT 1');
-  if (schedRes.rows.length === 0) {
-    await pool.query(`INSERT INTO work_schedules (morning_in_start, morning_in_end, morning_out_start, morning_out_end, afternoon_in_start, afternoon_in_end, afternoon_out_start, afternoon_out_end) 
-      VALUES ('06:00', '07:00', '11:30', '12:00', '12:00', '13:00', '17:00', '18:00')`);
-    schedRes = await pool.query('SELECT * FROM work_schedules LIMIT 1');
-  }
   const sched = schedRes.rows[0];
   let content = `
     <header><div class="brand"><h2>Work Schedule & Time Windows</h2></div></header>
     ${adminNav}
     <div class="card">
       <form action="/admin/schedule" method="POST">
-        <h3>Morning Session Settings</h3>
+        <h3>Morning Session</h3>
         <div style="display: flex; gap: 15px;">
-          <div style="flex:1;"><label>Time IN Start</label><input type="time" name="morning_in_start" value="${sched.morning_in_start || '06:00'}"></div>
-          <div style="flex:1;"><label>Time IN End</label><input type="time" name="morning_in_end" value="${sched.morning_in_end || '07:00'}"></div>
+          <div style="flex:1;"><label>Time IN Start</label><input type="time" name="morning_in_start" value="${sched.morning_in_start}"></div>
+          <div style="flex:1;"><label>Time IN End</label><input type="time" name="morning_in_end" value="${sched.morning_in_end}"></div>
         </div>
         <div style="display: flex; gap: 15px;">
-          <div style="flex:1;"><label>Time OUT Start</label><input type="time" name="morning_out_start" value="${sched.morning_out_start || '11:30'}"></div>
-          <div style="flex:1;"><label>Time OUT End</label><input type="time" name="morning_out_end" value="${sched.morning_out_end || '12:00'}"></div>
+          <div style="flex:1;"><label>Time OUT Start</label><input type="time" name="morning_out_start" value="${sched.morning_out_start}"></div>
+          <div style="flex:1;"><label>Time OUT End</label><input type="time" name="morning_out_end" value="${sched.morning_out_end}"></div>
         </div>
-
-        <h3 style="margin-top: 20px;">Afternoon Session Settings</h3>
+        <h3 style="margin-top: 20px;">Afternoon Session</h3>
         <div style="display: flex; gap: 15px;">
-          <div style="flex:1;"><label>Time IN Start</label><input type="time" name="afternoon_in_start" value="${sched.afternoon_in_start || '12:00'}"></div>
-          <div style="flex:1;"><label>Time IN End</label><input type="time" name="afternoon_in_end" value="${sched.afternoon_in_end || '13:00'}"></div>
+          <div style="flex:1;"><label>Time IN Start</label><input type="time" name="afternoon_in_start" value="${sched.afternoon_in_start}"></div>
+          <div style="flex:1;"><label>Time IN End</label><input type="time" name="afternoon_in_end" value="${sched.afternoon_in_end}"></div>
         </div>
         <div style="display: flex; gap: 15px;">
-          <div style="flex:1;"><label>Time OUT Start</label><input type="time" name="afternoon_out_start" value="${sched.afternoon_out_start || '17:00'}"></div>
-          <div style="flex:1;"><label>Time OUT End</label><input type="time" name="afternoon_out_end" value="${sched.afternoon_out_end || '18:00'}"></div>
+          <div style="flex:1;"><label>Time OUT Start</label><input type="time" name="afternoon_out_start" value="${sched.afternoon_out_start}"></div>
+          <div style="flex:1;"><label>Time OUT End</label><input type="time" name="afternoon_out_end" value="${sched.afternoon_out_end}"></div>
         </div>
-
         <button type="submit" class="btn btn-success" style="margin-top: 20px;">Save Schedule</button>
       </form>
     </div>
@@ -1202,137 +1180,10 @@ app.get('/admin/schedule', requireAdmin, async (req, res) => {
 
 app.post('/admin/schedule', requireAdmin, async (req, res) => {
   const { morning_in_start, morning_in_end, morning_out_start, morning_out_end, afternoon_in_start, afternoon_in_end, afternoon_out_start, afternoon_out_end } = req.body;
-  try {
-    const check = await pool.query('SELECT * FROM work_schedules LIMIT 1');
-    if (check.rows.length === 0) {
-      await pool.query(`INSERT INTO work_schedules (morning_in_start, morning_in_end, morning_out_start, morning_out_end, afternoon_in_start, afternoon_in_end, afternoon_out_start, afternoon_out_end) 
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-        [morning_in_start, morning_in_end, morning_out_start, morning_out_end, afternoon_in_start, afternoon_in_end, afternoon_out_start, afternoon_out_end]);
-    } else {
-      await pool.query(`UPDATE work_schedules SET morning_in_start = $1, morning_in_end = $2, morning_out_start = $3, morning_out_end = $4, afternoon_in_start = $5, afternoon_in_end = $6, afternoon_out_start = $7, afternoon_out_end = $8 WHERE id = $9`,
-        [morning_in_start, morning_in_end, morning_out_start, morning_out_end, afternoon_in_start, afternoon_in_end, afternoon_out_start, afternoon_out_end, check.rows[0].id]);
-    }
-    res.redirect('/admin/schedule');
-  } catch (err) {
-    console.error('Error saving schedule:', err);
-    res.status(500).send('Database Error saving schedule: ' + err.message);
-  }
-});
-
-
-// --- PAYROLL OFFICER PORTAL (Sahod, Indibidwal na Reset / Mark as Paid) ---
-const payrollNav = `
-  <nav class="no-print">
-    <a href="/payroll">Payroll Dashboard</a>
-    <a href="/payroll/logout" style="background: var(--danger); color: white; margin-left: auto;">Logout</a>
-  </nav>
-`;
-
-app.get('/payroll', requirePayroll, async (req, res) => {
-  const settings = await getSettings();
-  const workers = await pool.query('SELECT * FROM workers');
-
-  let salaryData = [];
-  let grandTotalNet = 0;
-
-  for (let w of workers.rows) {
-    const attRes = await pool.query(
-      'SELECT attendance_date, COUNT(*) as scan_count FROM attendance_logs WHERE worker_id = $1 GROUP BY attendance_date', 
-      [w.worker_id]
-    );
-    
-    let totalEquivalentDays = 0;
-    for (let row of attRes.rows) {
-      let scans = parseInt(row.scan_count);
-      if (scans >= 4) {
-        totalEquivalentDays += 1.0;
-      } else if (scans >= 2) {
-        totalEquivalentDays += 0.5;
-      }
-    }
-
-    let totalSalary = totalEquivalentDays * parseFloat(w.daily_rate);
-    const advRes = await pool.query('SELECT SUM(amount) as total_adv FROM advance_money WHERE worker_id = $1', [w.worker_id]);
-    let totalAdvance = parseFloat(advRes.rows[0].total_adv) || 0;
-
-    const dedRes = await pool.query('SELECT SUM(amount) as total_ded FROM deductions WHERE worker_id = $1', [w.worker_id]);
-    let totalDeductions = parseFloat(dedRes.rows[0].total_ded) || 0;
-
-    let netSalary = totalSalary - totalAdvance - totalDeductions;
-    if (netSalary < 0) netSalary = 0;
-
-    // Alamin kung may natitira pang sahod o records (para malaman kung naka-sahod na ba)
-    const hasPendingRecords = (totalEquivalentDays > 0 || totalAdvance > 0 || totalDeductions > 0);
-
-    grandTotalNet += netSalary;
-
-    salaryData.push({
-      ...w,
-      totalEquivalentDays: totalEquivalentDays.toFixed(1),
-      totalSalary: totalSalary,
-      totalAdvance: totalAdvance,
-      totalDeductions: totalDeductions,
-      netSalary: netSalary,
-      hasPendingRecords: hasPendingRecords
-    });
-  }
-
-  let content = `
-    <header>
-      <div class="brand">
-        ${settings.company_logo ? `<img src="${settings.company_logo}" alt="Logo">` : ''}
-        <h2>${settings.company_name} - Payroll Portal</h2>
-      </div>
-      <div>Logged in as: <strong>${req.session.payrollUsername}</strong></div>
-    </header>
-    ${payrollNav}
-    <div class="card" style="display: flex; gap: 15px; flex-wrap: wrap; justify-content: space-between; align-items: center;">
-      <div>
-        <h3>Payroll & Payout Monitoring</h3>
-        <p>Total Net Payout para sa Lahat: <strong style="color: var(--success); font-size: 18px;">₱${grandTotalNet.toFixed(2)}</strong></p>
-      </div>
-    </div>
-    <div class="card">
-      <h3>Listahan ng Sahod ng mga Manggagawa (Indibidwal na Pag-reset)</h3>
-      <p style="font-size:13px; color:#64748b; margin-bottom:15px;">I-click ang "Mark as Paid / Reset" sa bawat worker kapag naibigay na ang kanilang sahod para malaman kung sino pa ang hindi nakakasahod.</p>
-      <table>
-        <tr><th>ID</th><th>Name</th><th>Daily Rate</th><th>Total Days</th><th>Net Salary</th><th>Katayuan (Status)</th><th>Action</th></tr>
-        ${salaryData.map(s => `
-          <tr>
-            <td>${s.worker_id}</td>
-            <td>${s.full_name}</td>
-            <td>₱${s.daily_rate}</td>
-            <td>${s.totalEquivalentDays} days</td>
-            <td><strong>₱${s.netSalary.toFixed(2)}</strong></td>
-            <td>
-              ${s.hasPendingRecords ? '<span class="badge badge-warning">May Sahod / Hindi Pa Naka-Claim</span>' : '<span class="badge badge-success">Naka-sahod na (Paid)</span>'}
-            </td>
-            <td>
-              ${s.hasPendingRecords ? `<a href="/payroll/worker/reset/${s.worker_id}" class="btn btn-success" onclick="return confirm('I-mark ba na naka-sahod na si ${s.full_name}? (Mabubura muna ang attendance/advance/deductions niya para sa susunod na cycle)');" style="padding:4px 8px; font-size:12px;">Mark as Paid</a>` : '<span style="font-size:12px; color:#64748b;">Tapos na</span>'}
-            </td>
-          </tr>
-        `).join('')}
-      </table>
-    </div>
-  `;
-  res.send(layout('Payroll Portal', content));
-});
-
-app.get('/payroll/worker/reset/:worker_id', requirePayroll, async (req, res) => {
-  const { worker_id } = req.params;
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    await client.query('DELETE FROM attendance_logs WHERE worker_id = $1', [worker_id]);
-    await client.query('DELETE FROM advance_money WHERE worker_id = $1', [worker_id]);
-    await client.query('DELETE FROM deductions WHERE worker_id = $1', [worker_id]);
-    await client.query('COMMIT');
-  } catch (err) {
-    await client.query('ROLLBACK');
-  } finally {
-    client.release();
-  }
-  res.redirect('/payroll');
+  const check = await pool.query('SELECT * FROM work_schedules LIMIT 1');
+  await pool.query('UPDATE work_schedules SET morning_in_start = $1, morning_in_end = $2, morning_out_start = $3, morning_out_end = $4, afternoon_in_start = $5, afternoon_in_end = $6, afternoon_out_start = $7, afternoon_out_end = $8 WHERE id = $9',
+    [morning_in_start, morning_in_end, morning_out_start, morning_out_end, afternoon_in_start, afternoon_in_end, afternoon_out_start, afternoon_out_end, check.rows[0].id]);
+  res.redirect('/admin/schedule');
 });
 
 
@@ -1351,9 +1202,7 @@ app.get('/worker/login', async (req, res) => {
         <input type="password" name="password" required>
         <button type="submit" class="btn btn-success" style="width: 100%; padding: 12px; margin-bottom: 15px;">Login</button>
       </form>
-      <div style="text-align: center; font-size: 13px; color: #64748b;">
-        *Note: Kung bagong rehistro ka, ang default password mo ay ang iyong Worker ID mismo.
-      </div>
+      <div style="text-align: center;"><a href="/">Bumalik sa Home</a></div>
     </div>
   `;
   res.send(layout(settings.company_name + ' - Worker Login', content));
@@ -1363,85 +1212,51 @@ app.post('/worker/login', async (req, res) => {
   const { worker_id, password } = req.body;
   try {
     const result = await pool.query('SELECT * FROM workers WHERE worker_id = $1', [worker_id]);
-    if (result.rows.length === 0) {
-      return res.redirect('/worker/login?error=Invalid Worker ID or Password.');
-    }
+    if (result.rows.length === 0) return res.redirect('/worker/login?error=Invalid Worker ID.');
     const worker = result.rows[0];
     const match = await bcrypt.compare(password, worker.password);
-    if (!match) {
-      return res.redirect('/worker/login?error=Invalid Worker ID or Password.');
-    }
-
+    if (!match) return res.redirect('/worker/login?error=Invalid Password.');
     req.session.workerId = worker.worker_id;
     res.redirect('/worker');
   } catch (err) {
-    res.redirect('/worker/login?error=Server error during login.');
+    res.redirect('/worker/login?error=Server error.');
   }
 });
 
 app.get('/worker/logout', (req, res) => {
-  req.session.destroy(() => {
-    res.redirect('/worker/login');
-  });
+  req.session.destroy(() => res.redirect('/worker/login'));
 });
 
 app.post('/worker/change-password', async (req, res) => {
-  if (!req.session || !req.session.workerId) {
-    return res.redirect('/worker/login');
-  }
-
+  if (!req.session || !req.session.workerId) return res.redirect('/worker/login');
   const worker_id = req.session.workerId;
   const { current_password, new_password } = req.body;
-
   try {
     const result = await pool.query('SELECT * FROM workers WHERE worker_id = $1', [worker_id]);
-    if (result.rows.length === 0) {
-      return res.redirect('/worker?error=Worker not found.');
-    }
-
     const worker = result.rows[0];
     const match = await bcrypt.compare(current_password, worker.password);
-    if (!match) {
-      return res.redirect('/worker?error=Mali ang iyong kasalukuyang password.');
-    }
-
-    const hashedNewPassword = await bcrypt.hash(new_password, 10);
-    await pool.query('UPDATE workers SET password = $1 WHERE worker_id = $2', [hashedNewPassword, worker_id]);
-
-    res.redirect('/worker?success=Matagumpay na nabago ang iyong password!');
+    if (!match) return res.redirect('/worker?error=Mali ang kasalukuyang password.');
+    const hashed = await bcrypt.hash(new_password, 10);
+    await pool.query('UPDATE workers SET password = $1 WHERE worker_id = $2', [hashed, worker_id]);
+    res.redirect('/worker?success=Matagumpay na nabago ang password!');
   } catch (err) {
-    res.redirect('/worker?error=Server error sa pagpapalit ng password.');
+    res.redirect('/worker?error=Server error.');
   }
 });
 
 app.get('/worker', async (req, res) => {
-  if (!req.session || !req.session.workerId) {
-    return res.redirect('/worker/login');
-  }
-
+  if (!req.session || !req.session.workerId) return res.redirect('/worker/login');
   const settings = await getSettings();
   const worker_id = req.session.workerId;
   const errorMsg = req.query.error || '';
   const successMsg = req.query.success || '';
 
-  let worker = null;
-  let attendance = [];
-  let advances = [];
-  let deductions = [];
-  let announcements = [];
-
   const wRes = await pool.query('SELECT * FROM workers WHERE worker_id = $1', [worker_id]);
-  if (wRes.rows.length > 0) {
-    worker = wRes.rows[0];
-    const attRes = await pool.query('SELECT * FROM attendance_logs WHERE worker_id = $1 ORDER BY attendance_date DESC, created_at DESC LIMIT 20', [worker_id]);
-    attendance = attRes.rows;
-    const advRes = await pool.query('SELECT * FROM advance_money WHERE worker_id = $1 ORDER BY advance_date DESC', [worker_id]);
-    advances = advRes.rows;
-    const dedRes = await pool.query('SELECT * FROM deductions WHERE worker_id = $1 ORDER BY deduction_date DESC', [worker_id]);
-    deductions = dedRes.rows;
-  }
+  const worker = wRes.rows[0];
+  const attRes = await pool.query('SELECT * FROM attendance_logs WHERE worker_id = $1 ORDER BY attendance_date DESC, created_at DESC LIMIT 20', [worker_id]);
+  const advRes = await pool.query('SELECT * FROM advance_money WHERE worker_id = $1 ORDER BY advance_date DESC', [worker_id]);
+  const dedRes = await pool.query('SELECT * FROM deductions WHERE worker_id = $1 ORDER BY deduction_date DESC', [worker_id]);
   const annRes = await pool.query('SELECT * FROM announcements ORDER BY created_at DESC LIMIT 5');
-  announcements = annRes.rows;
 
   let content = `
     <header>
@@ -1449,90 +1264,80 @@ app.get('/worker', async (req, res) => {
         ${settings.company_logo ? `<img src="${settings.company_logo}" alt="Logo">` : ''}
         <h2>${settings.company_name} - Worker Portal</h2>
       </div>
-      <div>
-        <a href="/worker/logout" class="btn btn-danger" style="padding: 6px 12px; font-size: 13px;">Logout</a>
-      </div>
+      <div><a href="/worker/logout" class="btn btn-danger" style="padding: 6px 12px; font-size: 13px;">Logout</a></div>
     </header>
 
     ${errorMsg ? `<div class="alert-box alert-danger">${errorMsg}</div>` : ''}
     ${successMsg ? `<div class="alert-box alert-success">${successMsg}</div>` : ''}
 
-    ${worker ? `
-      <div class="card">
-        <h3>Welcome, ${worker.full_name} (${worker.worker_id})</h3>
-        <p><strong>Position:</strong> ${worker.position}</p>
-        <p><strong>Assigned Project:</strong> ${worker.assigned_project || '-'}</p>
-        <p><strong>Daily Rate:</strong> ₱${worker.daily_rate}</p>
-      </div>
-
-      <div class="card">
-        <h3>Palitan ang Password</h3>
-        <form action="/worker/change-password" method="POST">
-          <label>Kasalukuyang Password (Current Password)</label>
-          <input type="password" name="current_password" required>
-          <label>Bagong Password (New Password)</label>
-          <input type="password" name="new_password" required>
-          <button type="submit" class="btn">I-update ang Password</button>
-        </form>
-      </div>
-
-      <div class="card" style="text-align: center;">
-        <h3>My QR Code</h3>
-        <div id="qrcode" style="display: flex; justify-content: center; margin: 15px 0;"></div>
-        <p><strong>${worker.worker_id}</strong></p>
-      </div>
-      
-      <div class="card">
-        <h3>My Recent Attendance</h3>
-        <table>
-          <tr><th>Date</th><th>Time</th><th>Type</th></tr>
-          ${attendance.map(a => `<tr><td>${a.attendance_date.toISOString().split('T')[0]}</td><td>${a.attendance_time}</td><td><span class="badge ${a.attendance_type === 'IN' ? 'badge-success' : 'badge-warning'}">${a.attendance_type}</span></td></tr>`).join('')}
-        </table>
-      </div>
-
-      <div class="card">
-        <h3>Summary of Advances & Deductions (Mga Bawas at Cash Advance)</h3>
-        <p style="font-size:13px; color:#64748b; margin-bottom:15px;">Dito mo makikita kung ano ang mga nabawas o kinuha sa iyong sahod.</p>
-        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; flex-wrap: wrap;">
-          <div>
-            <h4>Cash Advances History</h4>
-            <table>
-              <tr><th>Date</th><th>Amount</th><th>Notes</th></tr>
-              ${advances.length > 0 ? advances.map(ad => `<tr><td>${ad.advance_date.toISOString().split('T')[0]}</td><td>₱${ad.amount}</td><td>${ad.notes || '-'}</td></tr>`).join('') : '<tr><td colspan="3" style="text-align:center; color:#64748b;">Walang cash advance.</td></tr>'}
-            </table>
-          </div>
-          <div>
-            <h4>Deductions (Meal, etc.)</h4>
-            <table>
-              <tr><th>Date</th><th>Name</th><th>Amount</th><th>Notes</th></tr>
-              ${deductions.length > 0 ? deductions.map(dd => `<tr><td>${dd.deduction_date.toISOString().split('T')[0]}</td><td>${dd.deduction_name}</td><td>₱${dd.amount}</td><td>${dd.notes || '-'}</td></tr>`).join('') : '<tr><td colspan="4" style="text-align:center; color:#64748b;">Walang deductions.</td></tr>'}
-            </table>
-          </div>
-        </div>
-      </div>
-
-      <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
-      <script>
-        new QRCode(document.getElementById("qrcode"), {
-          text: "${worker.worker_id}",
-          width: 150,
-          height: 150
-        });
-      </script>
-    ` : ''}
+    <div class="card">
+      <h3>Welcome, ${worker.full_name} (${worker.worker_id})</h3>
+      <p><strong>Position:</strong> ${worker.position}</p>
+      <p><strong>Assigned Project:</strong> ${worker.assigned_project || '-'}</p>
+      <p><strong>Daily Rate:</strong> ₱${worker.daily_rate}</p>
+    </div>
 
     <div class="card">
-      <h3>Company Announcements & Bulletins</h3>
-      ${announcements.length > 0 ? announcements.map(a => `<div style="border-bottom: 1px solid #cbd5e1; padding: 10px 0;"><h4>${a.title}</h4><small>${a.created_at.toISOString().replace('T', ' ').substring(0, 16)}</small><p>${a.content}</p></div>`).join('') : '<p style="color:#64748b;">Walang kasalukuyang anunsyo.</p>'}
+      <h3>Palitan ang Password</h3>
+      <form action="/worker/change-password" method="POST">
+        <label>Kasalukuyang Password</label>
+        <input type="password" name="current_password" required>
+        <label>Bagong Password</label>
+        <input type="password" name="new_password" required>
+        <button type="submit" class="btn">I-update ang Password</button>
+      </form>
     </div>
+
+    <div class="card" style="text-align: center;">
+      <h3>My QR Code</h3>
+      <div id="qrcode" style="display: flex; justify-content: center; margin: 15px 0;"></div>
+      <p><strong>${worker.worker_id}</strong></p>
+    </div>
+
+    <div class="card">
+      <h3>My Recent Attendance</h3>
+      <table>
+        <tr><th>Date</th><th>Time</th><th>Type</th></tr>
+        ${attRes.rows.map(a => `<tr><td>${a.attendance_date.toISOString().split('T')[0]}</td><td>${a.attendance_time}</td><td><span class="badge ${a.attendance_type === 'IN' ? 'badge-success' : 'badge-warning'}">${a.attendance_type}</span></td></tr>`).join('')}
+      </table>
+    </div>
+
+    <div class="card">
+      <h3>Summary of Advances & Deductions (Mga kaltas at advances sa sahod)</h3>
+      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px;">
+        <div>
+          <h4>Cash Advances History</h4>
+          <table>
+            <tr><th>Date</th><th>Amount</th><th>Notes</th></tr>
+            ${advRes.rows.map(ad => `<tr><td>${ad.advance_date.toISOString().split('T')[0]}</td><td>₱${ad.amount}</td><td>${ad.notes || '-'}</td></tr>`).join('')}
+          </table>
+        </div>
+        <div>
+          <h4>Deductions (Meal, Uniform, etc.)</h4>
+          <table>
+            <tr><th>Date</th><th>Name</th><th>Amount</th><th>Notes</th></tr>
+            ${dedRes.rows.map(dd => `<tr><td>${dd.deduction_date.toISOString().split('T')[0]}</td><td>${dd.deduction_name}</td><td>₱${dd.amount}</td><td>${dd.notes || '-'}</td></tr>`).join('')}
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Announcements (Paunawa)</h3>
+      ${annRes.rows.map(a => `<div style="border-bottom: 1px solid #cbd5e1; padding: 10px 0;"><h4>${a.title}</h4><small>${a.created_at.toISOString().replace('T', ' ').substring(0, 16)}</small><p>${a.content}</p></div>`).join('')}
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+    <script>new QRCode(document.getElementById("qrcode"), { text: "${worker.worker_id}", width: 150, height: 150 });</script>
   `;
   res.send(layout('Worker Portal', content));
 });
 
 
-// SCANNER PORTAL
+// SCANNER PORTAL (Accessible by Admin and Scanner Officer)
 app.get('/scanner', requireScanner, async (req, res) => {
   const settings = await getSettings();
+  const roleNav = req.session.role === 'admin' ? adminNav : `<nav class="no-print"><a href="/scanner/logout" style="background: var(--danger); color: white; margin-left: auto;">Logout</a></nav>`;
 
   let content = `
     <header>
@@ -1540,9 +1345,9 @@ app.get('/scanner', requireScanner, async (req, res) => {
         ${settings.company_logo ? `<img src="${settings.company_logo}" alt="Logo">` : ''}
         <h2>${settings.company_name} - Scanner Portal</h2>
       </div>
-      <div>Logged in as: <strong>${req.session.scannerUsername}</strong> | <a href="/scanner/logout" style="color:var(--danger); font-weight:bold;">Logout</a></div>
+      <div>Logged in as: <strong>${req.session.adminUsername} (${req.session.role.toUpperCase()})</strong></div>
     </header>
-
+    ${roleNav}
     <div class="card">
       <h3>Worker QR Attendance Scanner (Meal Deduction)</h3>
       <div style="margin-bottom: 15px; display: flex; gap: 10px;">
@@ -1625,7 +1430,7 @@ app.get('/scanner', requireScanner, async (req, res) => {
         const resultDiv = document.getElementById('scanResult');
 
         if (!data.success) {
-          resultDiv.innerHTML = `<div class="alert-box alert-danger">ERROR: ${data.message}</div>`;
+          resultDiv.innerHTML = '<div class="alert-box alert-danger">ERROR: ' + data.message + '</div>';
           setTimeout(() => {
             resultDiv.innerHTML = '';
             startScanner();
@@ -1651,9 +1456,9 @@ app.get('/scanner', requireScanner, async (req, res) => {
 
         if (data.success) {
           let mealMsg = isEating ? '<br><span style="color:var(--danger)">May nabawas na Meal Deduction (₱' + data.mealAmount + ')</span>' : '<br><span style="color:var(--success)">Walang meal deduction.</span>';
-          resultDiv.innerHTML = `<div class="alert-box alert-success">SUCCESS! (${data.stepDescription})<br>${data.worker.full_name}<br>ID: ${data.worker.worker_id}<br>TIME ${currentMode}<br>${data.date} ${data.time}${mealMsg}</div>`;
+          resultDiv.innerHTML = '<div class="alert-box alert-success">SUCCESS! (' + data.stepDescription + ')<br>' + data.worker.full_name + '<br>ID: ' + data.worker.worker_id + '<br>TIME ' + currentMode + '<br>' + data.date + ' ' + data.time + mealMsg + '</div>';
         } else {
-          resultDiv.innerHTML = `<div class="alert-box alert-danger">ERROR: ${data.message}</div>`;
+          resultDiv.innerHTML = '<div class="alert-box alert-danger">ERROR: ' + data.message + '</div>';
         }
 
         pendingWorkerId = null;
@@ -1667,106 +1472,48 @@ app.get('/scanner', requireScanner, async (req, res) => {
   res.send(layout('Scanner Portal', content));
 });
 
-// API Endpoint Step 1: Validate Attendance Rules with Time Window Check
+// API Endpoints for Attendance
 app.post('/api/attendance/check', async (req, res) => {
   const { worker_id, attendance_type } = req.body;
   const client = await pool.connect();
   try {
     const workerRes = await client.query("SELECT * FROM workers WHERE worker_id = $1 AND status = 'Active'", [worker_id]);
-    if (workerRes.rows.length === 0) {
-      return res.json({ success: false, message: 'Worker not found or inactive.' });
-    }
+    if (workerRes.rows.length === 0) return res.json({ success: false, message: 'Worker not found or inactive.' });
     const worker = workerRes.rows[0];
     
     const ph = getPHTime();
     const today = ph.date;
     const currentTime24 = ph.time24;
 
-    const todayLogsRes = await client.query(
-      'SELECT * FROM attendance_logs WHERE worker_id = $1 AND attendance_date = $2 ORDER BY created_at ASC, id ASC',
-      [worker_id, today]
-    );
+    const todayLogsRes = await client.query('SELECT * FROM attendance_logs WHERE worker_id = $1 AND attendance_date = $2 ORDER BY created_at ASC, id ASC', [worker_id, today]);
     const logsCount = todayLogsRes.rows.length;
 
     let expectedType = '';
     let stepDescription = '';
 
-    if (logsCount === 0) {
-      expectedType = 'IN';
-      stepDescription = '1st Scan: Umaga Time IN';
-    } else if (logsCount === 1) {
-      expectedType = 'OUT';
-      stepDescription = '2nd Scan: Umaga Time OUT (Lunch Break)';
-    } else if (logsCount === 2) {
-      expectedType = 'IN';
-      stepDescription = '3rd Scan: Hapon Time IN';
-    } else if (logsCount === 3) {
-      expectedType = 'OUT';
-      stepDescription = '4th Scan: Hapon Time OUT (Uwian)';
-    } else {
-      return res.json({ success: false, message: 'Tapos na ang 4 na beses na pag-scan mo ngayong araw.' });
-    }
+    if (logsCount === 0) { expectedType = 'IN'; stepDescription = '1st Scan: Umaga Time IN'; }
+    else if (logsCount === 1) { expectedType = 'OUT'; stepDescription = '2nd Scan: Umaga Time OUT'; }
+    else if (logsCount === 2) { expectedType = 'IN'; stepDescription = '3rd Scan: Hapon Time IN'; }
+    else if (logsCount === 3) { expectedType = 'OUT'; stepDescription = '4th Scan: Hapon Time OUT'; }
+    else { return res.json({ success: false, message: 'Tapos na ang 4 na beses na pag-scan ngayong araw.' }); }
 
     if (attendance_type !== expectedType) {
-      return res.json({ 
-        success: false, 
-        message: `Maling pindot! Ang sunod mong i-scan ay ${expectedType} (${stepDescription}).` 
-      });
-    }
-
-    // TIME WINDOW VALIDATION
-    const schedRes = await client.query('SELECT * FROM work_schedules LIMIT 1');
-    if (schedRes.rows.length > 0) {
-      const s = schedRes.rows[0];
-      let windowStart = '';
-      let windowEnd = '';
-      let sessionName = '';
-
-      if (logsCount === 0) {
-        windowStart = s.morning_in_start;
-        windowEnd = s.morning_in_end;
-        sessionName = 'Umaga Time IN';
-      } else if (logsCount === 1) {
-        windowStart = s.morning_out_start;
-        windowEnd = s.morning_out_end;
-        sessionName = 'Umaga Time OUT';
-      } else if (logsCount === 2) {
-        windowStart = s.afternoon_in_start;
-        windowEnd = s.afternoon_in_end;
-        sessionName = 'Hapon Time IN';
-      } else if (logsCount === 3) {
-        windowStart = s.afternoon_out_start;
-        windowEnd = s.afternoon_out_end;
-        sessionName = 'Hapon Time OUT';
-      }
-
-      if (windowStart && windowEnd) {
-        const curTime = currentTime24.substring(0, 5);
-        if (curTime < windowStart || curTime > windowEnd) {
-          return res.json({
-            success: false,
-            message: `Hindi pa oras o lampas na para sa ${sessionName}!\nNakatakdang oras: ${formatTimeTo12Hour(windowStart)} hanggang ${formatTimeTo12Hour(windowEnd)}.`
-          });
-        }
-      }
+      return res.json({ success: false, message: `Maling pindot! Ang sunod ay ${expectedType} (${stepDescription}).` });
     }
 
     res.json({ success: true, worker, stepDescription });
   } catch (err) {
-    console.error('Error checking attendance:', err);
     res.json({ success: false, message: 'Server error during attendance validation.' });
   } finally {
     client.release();
   }
 });
 
-// API Endpoint Step 2: Commit Attendance with 12-hour formatted time string
 app.post('/api/attendance/commit', async (req, res) => {
   const { worker_id, attendance_type, is_eating } = req.body;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    
     const workerRes = await client.query('SELECT * FROM workers WHERE worker_id = $1', [worker_id]);
     const worker = workerRes.rows[0];
 
@@ -1774,20 +1521,13 @@ app.post('/api/attendance/commit', async (req, res) => {
     const today = ph.date;
     const timeStr12 = ph.time;
 
-    await client.query(
-      'INSERT INTO attendance_logs (worker_id, attendance_date, attendance_time, attendance_type) VALUES ($1, $2, $3, $4)',
-      [worker_id, today, timeStr12, attendance_type]
-    );
+    await client.query('INSERT INTO attendance_logs (worker_id, attendance_date, attendance_time, attendance_type) VALUES ($1, $2, $3, $4)', [worker_id, today, timeStr12, attendance_type]);
 
     let mealAmount = 0;
     if (is_eating) {
       const settingsRes = await client.query('SELECT default_meal_deduction FROM company_settings LIMIT 1');
       mealAmount = parseFloat(settingsRes.rows[0]?.default_meal_deduction || 50.00);
-
-      await client.query(
-        'INSERT INTO deductions (worker_id, deduction_name, amount, deduction_date, notes) VALUES ($1, $2, $3, $4, $5)',
-        [worker_id, 'Meal Deduction', mealAmount, today, `Automatic deduction from QR scan (${attendance_type})`]
-      );
+      await client.query('INSERT INTO deductions (worker_id, deduction_name, amount, deduction_date, notes) VALUES ($1, $2, $3, $4, $5)', [worker_id, 'Meal Deduction', mealAmount, today, `Automatic deduction from QR scan (${attendance_type})`]);
     }
 
     await client.query('COMMIT');
